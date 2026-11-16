@@ -16,6 +16,7 @@ import {
 import type { PolicyFinding } from '../policy/diff-policy.js';
 import { sanitizeAgentText } from '../policy/secrets.js';
 import type { Person, TicketSnapshot } from '../tracker/tracker.js';
+import type { FailingTestProof } from './failing-test.js';
 import type { CriterionResult } from './prompts.js';
 import type { CheckResult } from './workspace.js';
 
@@ -347,9 +348,48 @@ export interface PullRequestBodyInput {
   costUsd: number | undefined;
   durationMs: number;
   fixRounds: number;
+  /** Bug fixes: whether the new tests fail without the fix (E5). */
+  proof?: FailingTestProof;
 }
 
 const MAX_PR_BODY = 60_000;
+
+function listed(paths: readonly string[]): string {
+  return `${paths.slice(0, 5).join(', ')}${paths.length > 5 ? ', …' : ''}`;
+}
+
+/** E5: what Lockkeeper found when it ran the new tests without the fix. */
+function proofParagraph(proof: FailingTestProof): Doc[number] {
+  switch (proof.kind) {
+    case 'proven':
+      return paragraph(
+        bold('Failing test first: '),
+        text('without the fix, '),
+        code(proof.command),
+        text(
+          ` failed (exit ${proof.exitCode}) with the new tests (${listed(proof.tests)}). With the fix, it passes.`,
+        ),
+      );
+    case 'passed_before':
+      return paragraph(
+        bold('Failing test first: no. '),
+        text(
+          `The new tests (${listed(proof.tests)}) pass without the fix too, so they do not show the bug.`,
+        ),
+      );
+    case 'no_test':
+      return paragraph(
+        bold('No failing test. '),
+        text(
+          proof.reason
+            ? `The agent says: ${proof.reason}`
+            : 'The agent added no test and gave no reason.',
+        ),
+      );
+    case 'skipped':
+      return paragraph(bold('Failing test first: not checked. '), text(proof.reason));
+  }
+}
 
 export function pullRequestBodyDoc(input: PullRequestBodyInput): Doc {
   const { ctx } = input;
@@ -411,6 +451,7 @@ export function pullRequestBodyDoc(input: PullRequestBodyInput): Doc {
       doc.push(codeBlock(check.output));
     }
   }
+  if (input.proof) doc.push(proofParagraph(input.proof));
 
   doc.push(heading(1, 'Risks and things to check'));
   const riskItems: Inline[][] = [];

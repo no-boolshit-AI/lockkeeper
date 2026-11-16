@@ -28,6 +28,16 @@ import { RecordingTracker } from '../tracker/recording-tracker.js';
 import type { TicketSnapshot, Tracker } from '../tracker/tracker.js';
 import { detectCommands } from './detect.js';
 import { allowList } from './domains.js';
+import { type ResolvedCommands, resolveCommands } from './environment.js';
+import {
+  changedPaths,
+  checkoutTestsOnBase,
+  type FailingTestProof,
+  isTestPath,
+  restoreTree,
+  saveTree,
+  testCommands,
+} from './failing-test.js';
 import {
   type AgentReport,
   buildFixPrompt,
@@ -192,6 +202,8 @@ interface Work {
   report?: AgentReport;
   checks: CheckResult[];
   draftReasons: string[];
+  /** Bug fixes: whether the new tests fail without the fix (E5). */
+  proof?: FailingTestProof;
 }
 
 function normalizeKey(input: string): string {
@@ -606,18 +618,32 @@ class TicketRun {
 
     // Setup (E6)
     this.setState('setup');
-    let setup = this.settings.setup;
-    let verify = this.settings.verify;
-    if (setup === undefined || verify === undefined) {
+    let setup = this.settings.setup ?? [];
+    let verify = this.settings.verify ?? [];
+    let sources: ResolvedCommands['sources'] = {
+      setup: 'lockkeeper.yml',
+      verify: 'lockkeeper.yml',
+    };
+    if (this.settings.setup === undefined || this.settings.verify === undefined) {
       const root = await inspectRoot(sandbox, layout);
-      const detected = detectCommands(root.files, root.packageJson);
-      setup ??= detected.setup;
-      verify ??= detected.verify;
-      this.audit('detected_commands', detected);
+      const [devcontainer] = await readInstructionFiles(sandbox, layout, instructionsBase.sha, [
+        '.devcontainer/devcontainer.json',
+        '.devcontainer.json',
+      ]);
+      const resolved = resolveCommands({
+        configured: { setup: this.settings.setup, verify: this.settings.verify },
+        devcontainer: devcontainer?.content,
+        agentsMd: this.instructions.find((file) => file.path === 'AGENTS.md')?.content,
+        detected: detectCommands(root.files, root.packageJson),
+      });
+      ({ setup, verify, sources } = resolved);
     }
     this.verify = verify;
-    // Saved, not detected again on resume: by then the agent may have changed the files.
-    this.audit('commands', { setup, verify });
+    // Saved, not worked out again on resume: by then the agent may have changed the files.
+    this.audit('commands', { setup, verify, sources });
+    if (sources.setup !== 'lockkeeper.yml' || sources.verify !== 'lockkeeper.yml') {
+      this.log.info(`Commands: setup from ${sources.setup}, checks from ${sources.verify}`);
+    }
     if (setup.length > 0) {
       this.log.step(`Setting up: ${setup.join(' && ')}`);
       const timeout = this.stepTimeout(config.limits.setup_minutes * 60_000);
@@ -854,6 +880,14 @@ class TicketRun {
       this.layout,
       start?.instructionsBase.sha ?? baseSha,
     );
+    const proof = this.deps.store.latestEvent<{ fixSha: string; done?: boolean }>(
+      this.run.id,
+      'proof_state',
+    );
+    if (proof && !proof.done) {
+      await restoreTree(this.sandbox, this.layout, proof.fixSha);
+      this.audit('proof_state', { fixSha: proof.fixSha, done: true });
+    }
     await this.extendSandbox(this.sandboxTimeout());
   }
 
@@ -1006,11 +1040,74 @@ class TicketRun {
       prompts.push(next);
       this.update({ fixRounds: this.fixRounds });
     }
+    let proof: FailingTestProof | undefined;
+    if (workflow === 'bugfix' && checks.every((check) => check.passed)) {
+      proof = await this.proveFailingTest(ctx, report);
+    }
     this.checkCancelled();
-    const work: Work = { finalText, ...(report ? { report } : {}), checks, draftReasons };
+    const work: Work = {
+      finalText,
+      ...(report ? { report } : {}),
+      checks,
+      draftReasons,
+      ...(proof ? { proof } : {}),
+    };
     this.audit('implemented', work);
     this.setState('collect');
     return work;
+  }
+
+  /**
+   * E5: run the test commands on the base code with only the agent's new and changed
+   * tests, and expect a failure. The fixed code is saved first and always put back.
+   */
+  private async proveFailingTest(
+    ctx: RunContext,
+    report: AgentReport | undefined,
+  ): Promise<FailingTestProof> {
+    const sandbox = this.sandbox as SandboxHandle;
+    const layout = this.layout as Layout;
+    const base = this.base as BaseRef;
+    const commands = testCommands(this.verify);
+    const tests = (await changedPaths(sandbox, layout, base.sha)).filter(isTestPath);
+    let proof: FailingTestProof;
+    if (tests.length === 0) {
+      proof = {
+        kind: 'no_test',
+        reason: cleanAgentText(report?.no_failing_test_reason ?? '', 300),
+      };
+    } else if (commands.length === 0) {
+      proof = { kind: 'skipped', reason: 'No test command is configured or detected.' };
+    } else {
+      this.log.step('Checking that the new tests fail without the fix');
+      await this.progress(ctx, 'Lockkeeper is checking that the new tests fail without the fix');
+      const fixSha = await saveTree(sandbox, layout);
+      this.audit('proof_state', { fixSha });
+      try {
+        if (!(await checkoutTestsOnBase(sandbox, layout, base.sha, fixSha, tests))) {
+          proof = {
+            kind: 'skipped',
+            reason: 'git could not combine the base code with the new tests.',
+          };
+        } else {
+          const results = await runCommands(sandbox, layout, commands, {
+            timeoutMs: this.stepTimeout(this.deps.config.limits.verify_minutes * 60_000),
+            stopOnFailure: false,
+            now: this.now,
+          });
+          this.audit('proof_checks', results);
+          const failed = results.find((result) => !result.passed);
+          proof = failed
+            ? { kind: 'proven', tests, command: failed.command, exitCode: failed.exitCode }
+            : { kind: 'passed_before', tests, commands };
+        }
+      } finally {
+        await restoreTree(sandbox, layout, fixSha);
+        this.audit('proof_state', { fixSha, done: true });
+      }
+    }
+    this.audit('proof', proof);
+    return proof;
   }
 
   /** Package and check the result (V2), then publish it. */
@@ -1066,6 +1163,12 @@ class TicketRun {
       ...this.draftReasons(work.checks, this.verify, policy, criteria, ticket),
       ...work.draftReasons,
     ];
+    if (work.proof?.kind === 'passed_before')
+      draftReasons.push('The new tests pass without the fix too, so they do not show the bug.');
+    if (work.proof?.kind === 'no_test' && !work.proof.reason)
+      draftReasons.push(
+        'The bug fix adds no test that fails without it, and the agent gave no reason.',
+      );
 
     return this.publish({
       ctx,
@@ -1079,6 +1182,7 @@ class TicketRun {
       checks: work.checks,
       draftReasons,
       reviewedFiles: reviewed.files.length,
+      ...(work.proof ? { proof: work.proof } : {}),
     });
   }
 
@@ -1119,6 +1223,7 @@ class TicketRun {
     draftReasons: string[];
     /** Files the pull request changes in total, which a retry's commit may not all touch. */
     reviewedFiles: number;
+    proof?: FailingTestProof;
   }): Promise<RunResult> {
     const { config, scm } = this.deps;
     const { ctx, collected, policy } = input;
@@ -1148,6 +1253,7 @@ class TicketRun {
           costUsd: this.costUsd,
           durationMs,
           fixRounds: this.fixRounds,
+          ...(input.proof ? { proof: input.proof } : {}),
         }),
       ),
     );

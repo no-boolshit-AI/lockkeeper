@@ -80,8 +80,8 @@ Goal: a team labels tickets and gets PRs or questions back without anyone runnin
 | Component and label overrides for the repository; ask when it cannot be resolved | T5 | Done in M1 |
 | Run engine as a persistent state machine that resumes after a restart; parallel-run cap per install | E7, O2 | Done: runs reattach to a working agent and never publish twice |
 | Read-only readiness pass with its own small cap; numbered questions that mention the requester; `/agent go` resumes with the answers | R1, R2 | Done. Runs waiting for answers hold no sandbox or run slot |
-| Workflow override by label; the bugfix workflow proves a failing test first | E5 | Override done in M1; proof not started |
-| Environment order: `lockkeeper.yml`, then the dev container, then `AGENTS.md`, then detection | E6 | `lockkeeper.yml` and detection only |
+| Workflow override by label; the bugfix workflow proves a failing test first | E5 | Done. Lockkeeper runs the new tests without the fix; a test that passes anyway keeps the PR a draft |
+| Environment order: `lockkeeper.yml`, then the dev container, then `AGENTS.md`, then detection | E6 | Done |
 | Up to two fix rounds when verification fails. Diff-size and fix-round caps named on the ticket | V1, E7 | Done in M1 |
 | Acceptance-criteria evidence table. A criterion without evidence is listed as unmet and keeps the PR a draft | V4 | Done in M1 |
 | Final result comment, optional status transition | J1, J2 | Done in M1; the final comment now mentions whoever added the label |

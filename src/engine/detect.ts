@@ -1,7 +1,7 @@
 /**
- * Setup and verify commands when lockkeeper.yml gives none (E6, basic). The full order
- * from the PRD — config, then the dev container, then AGENTS.md, then detection —
- * arrives in M2; this covers the detection step for the common stacks.
+ * Setup and verify commands detected from the repository's files: the last step of the
+ * environment order (E6), after lockkeeper.yml, the dev container and AGENTS.md. See
+ * environment.ts.
  */
 
 export interface DetectedCommands {

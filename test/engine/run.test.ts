@@ -443,6 +443,27 @@ describe('runTicket', () => {
     expect(h.sandbox().destroyed).toBe(true);
   });
 
+  it('takes its checks from AGENTS.md when lockkeeper.yml names none', async () => {
+    h = harness({
+      config: '',
+      files: {
+        'README.md': '# Demo\n',
+        'AGENTS.md': 'Run `make test` before you finish.\n',
+        Makefile: 'test:\n\ttest -f hello.txt\n',
+      },
+      rounds: [{ writes: { 'hello.txt': 'hello\n' }, text: report() }],
+    });
+    const result = await runTicket(h.deps, { ticketKey: 'DEMO-1', triggeredBy: 'test' });
+
+    expect(result.outcome).toBe('pr');
+    expect(h.store.latestEvent(result.run.id, 'commands')).toEqual({
+      setup: [],
+      verify: ['make test'],
+      sources: { setup: 'detected', verify: 'AGENTS.md' },
+    });
+    expect(h.scm.pullRequests[0]?.body).toContain('`make test`: passed');
+  });
+
   it('uses the bugfix workflow and passes base-branch instructions to the agent', async () => {
     h = harness({
       files: { 'README.md': '# Demo\n', 'AGENTS.md': 'Use tabs for indentation.\n' },
@@ -911,5 +932,81 @@ describe('the readiness check', () => {
     const result = await runTicket(h.deps, { ticketKey: 'DEMO-1', triggeredBy: 'test' });
     expect(result.outcome).toBe('pr');
     expect(h.store.latestEvent(result.run.id, 'readiness')).toMatchObject({ verdict: 'unclear' });
+  });
+});
+
+describe('the failing-test check for bug fixes (E5)', () => {
+  let h: Harness | undefined;
+
+  afterEach(async () => {
+    if (!h) return;
+    await waitForAgents(h.sandboxes.sandboxes);
+    h.store.close();
+    rmSync(h.root, { recursive: true, force: true });
+    h = undefined;
+  });
+
+  const RUNNER = 'for t in test/*.test.sh; do [ -e "$t" ] || continue; sh "$t" || exit 1; done\n';
+  const bug = (rounds: AgentStep[]) =>
+    harness({
+      config: "repo:\n  setup: []\n  verify: ['sh test/run.sh']\n",
+      files: { 'README.md': '# Demo\n', 'test/run.sh': RUNNER },
+      ticket: ticketFixture({ issueType: 'Bug' }),
+      rounds,
+    });
+
+  it('shows that the new test fails without the fix, and keeps the fix intact', async () => {
+    h = bug([
+      {
+        writes: { 'test/greeting.test.sh': 'grep -q hello hello.txt\n', 'hello.txt': 'hello\n' },
+        text: report(),
+      },
+    ]);
+    const result = await runTicket(h.deps, { ticketKey: 'DEMO-1', triggeredBy: 'test' });
+
+    expect(result.outcome).toBe('pr');
+    expect(h.scm.pullRequests[0]?.draft).toBe(false);
+    expect(h.store.latestEvent(result.run.id, 'proof')).toEqual({
+      kind: 'proven',
+      tests: ['test/greeting.test.sh'],
+      command: 'sh test/run.sh',
+      exitCode: 1,
+    });
+    expect(h.scm.pullRequests[0]?.body).toContain('Failing test first:');
+    // The published change is the whole fix, after the test ran without it.
+    expect(h.scm.commits[0]?.changes.map((change) => change.path).sort()).toEqual([
+      'hello.txt',
+      'test/greeting.test.sh',
+    ]);
+  });
+
+  it('keeps the pull request a draft when the new test passes without the fix', async () => {
+    h = bug([
+      { writes: { 'test/always.test.sh': 'true\n', 'hello.txt': 'hello\n' }, text: report() },
+    ]);
+    const result = await runTicket(h.deps, { ticketKey: 'DEMO-1', triggeredBy: 'test' });
+
+    expect(result.outcome).toBe('pr');
+    if (result.outcome !== 'pr') return;
+    expect(result.draftReasons).toContain(
+      'The new tests pass without the fix too, so they do not show the bug.',
+    );
+    expect(h.scm.pullRequests[0]?.draft).toBe(true);
+  });
+
+  it('accepts a reason when no failing test is possible, and says so in the PR', async () => {
+    const reasoned = `Done.\n<lockkeeper-report>\n${JSON.stringify({
+      summary: 'Added hello.txt.',
+      criteria: MET,
+      tests: [],
+      risks: [],
+      no_failing_test_reason: 'The bug is a missing file, which no test here can load.',
+    })}\n</lockkeeper-report>`;
+    h = bug([{ writes: { 'hello.txt': 'hello\n' }, text: reasoned }]);
+    const result = await runTicket(h.deps, { ticketKey: 'DEMO-1', triggeredBy: 'test' });
+
+    expect(result.outcome).toBe('pr');
+    expect(h.scm.pullRequests[0]?.draft).toBe(false);
+    expect(h.scm.pullRequests[0]?.body).toContain('The agent says: The bug is a missing file');
   });
 });

@@ -20,10 +20,11 @@ Jira ticket ──snapshot──▶ control plane ──creates──▶ E2B san
 
 1. **Snapshot.** The ticket is captured as Markdown, with hidden text removed: invisible Unicode and text coloured so a person cannot read it.
 2. **Sandbox.** A fresh E2B microVM with outbound traffic denied except to the model API, GitHub and package registries.
-3. **Implement.** Claude Code runs headless in `--bare` mode, so repository hooks, settings and MCP servers are never loaded. It gets turn and budget caps. Bugs get a failing test first.
-4. **Verify.** Lockkeeper, not the agent, runs your lint and test commands. Failures go back to the agent for up to two fix rounds.
-5. **Publish.** The control plane reads the diff and checks it: protected paths, size, submodules, secrets. Then it creates a verified commit and the PR through the GitHub API. The PR is a draft, with the reason stated, unless every check passed and every acceptance criterion has evidence.
-6. **Report.** One status comment on the ticket, edited in place, plus a short final comment that notifies the requester, the PR as a remote link, and labels.
+3. **Readiness check.** A short read-only pass decides whether the ticket can be built as written, and asks on the ticket if not.
+4. **Implement.** Claude Code runs headless in `--bare` mode, so repository hooks, settings and MCP servers are never loaded. It gets turn and budget caps. Setup and test commands come from `lockkeeper.yml`, then the dev container, then `AGENTS.md`, then detection.
+5. **Verify.** Lockkeeper, not the agent, runs your lint and test commands. Failures go back to the agent for up to two fix rounds. For a bug, Lockkeeper also runs the agent's new tests without the fix and expects them to fail.
+6. **Publish.** The control plane reads the diff and checks it: protected paths, size, submodules, secrets. Then it creates a verified commit and the PR through the GitHub API. The PR is a draft, with the reason stated, unless every check passed and every acceptance criterion has evidence.
+7. **Report.** One status comment on the ticket, edited in place, plus a short final comment that notifies the requester, the PR as a remote link, and labels.
 
 ## Security model
 

@@ -44,7 +44,7 @@ export function buildSystemPrompt(input: SystemPromptInput): string {
   ];
   if (input.workflow === 'bugfix') {
     parts.push(
-      `This is a bug fix. First write a test that reproduces the bug and fails for the right reason. Then fix the bug and show that the test passes. If a failing test is not possible, say why in your report.`,
+      `This is a bug fix. First write a test that reproduces the bug and fails for the right reason. Then fix the bug and show that the test passes. Lockkeeper then runs your new tests without your fix and expects them to fail. If a failing test is not possible, give the reason in no_failing_test_reason in your report.`,
     );
   }
   for (const file of input.instructions) {
@@ -271,6 +271,8 @@ export const agentReportSchema = z.object({
     .default([]),
   tests: z.array(z.string()).default([]),
   risks: z.array(z.string()).default([]),
+  /** Bug fixes only: why no test can show the bug. */
+  no_failing_test_reason: z.string().optional(),
 });
 
 export type AgentReport = z.infer<typeof agentReportSchema>;

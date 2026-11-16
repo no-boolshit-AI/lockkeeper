@@ -5,6 +5,13 @@ import { parseCommand } from '../../src/engine/commands.js';
 import { detectCommands } from '../../src/engine/detect.js';
 import { allowList } from '../../src/engine/domains.js';
 import {
+  agentsMdCommands,
+  devcontainerSetup,
+  parseJsonc,
+  resolveCommands,
+} from '../../src/engine/environment.js';
+import { isTestPath, testCommands } from '../../src/engine/failing-test.js';
+import {
   gitBlobSha1,
   isObjectId,
   parseBlobExport,
@@ -313,5 +320,103 @@ describe('the readiness verdict (R1)', () => {
     expect(parseReadiness(block('not json'))).toBeUndefined();
     expect(parseReadiness('No block at all.')).toBeUndefined();
     expect(parseReadiness(block('```json\n{"verdict":"ready"}\n```'))?.verdict).toBe('ready');
+  });
+});
+
+describe('the environment order (E6)', () => {
+  const detected = { setup: ['npm install'], verify: ['npm test'], source: 'package.json' };
+
+  it('reads dev container setup: strings, exec arrays and named commands, with comments', () => {
+    const content = `{
+      // Comments and trailing commas are allowed.
+      "image": "mcr.microsoft.com/devcontainers/javascript-node",
+      "onCreateCommand": ["npm", "ci"],
+      /* parallel commands */
+      "postCreateCommand": { "tools": "pip install pre-commit", "url": "echo \\"http://x\\"" },
+      "postStartCommand": "npm run dev",
+    }`;
+    expect(devcontainerSetup(content)).toEqual([
+      'npm ci',
+      'pip install pre-commit',
+      'echo "http://x"',
+    ]);
+    expect(devcontainerSetup('not json')).toEqual([]);
+    expect(parseJsonc('{"a": "// not a comment", "b": [1, 2,],}')).toEqual({
+      a: '// not a comment',
+      b: [1, 2],
+    });
+  });
+
+  it('recognises setup and checks in AGENTS.md, and skips servers and watchers', () => {
+    const agents = [
+      '# Working here',
+      '',
+      'Install with `pnpm install`, then run `pnpm test` and `pnpm lint`.',
+      'Start the app with `pnpm dev`. Never run `pnpm test --watch` in CI.',
+      '',
+      '```bash',
+      '$ go mod download',
+      'go test ./...',
+      '```',
+      '',
+      '```json',
+      '{"npm test": true}',
+      '```',
+    ].join('\n');
+    expect(agentsMdCommands(agents)).toEqual({
+      setup: ['pnpm install', 'go mod download'],
+      verify: ['pnpm test', 'pnpm lint', 'go test ./...'],
+    });
+  });
+
+  it('takes each list from the first source that has one', () => {
+    const agentsMd = 'Run `npm ci`, then `npm run lint` and `npm test`.';
+    const devcontainer = '{"postCreateCommand": "npm ci && npx playwright install"}';
+    expect(
+      resolveCommands({ configured: { setup: undefined, verify: undefined }, detected }),
+    ).toMatchObject({ sources: { setup: 'detected', verify: 'detected' } });
+    expect(
+      resolveCommands({
+        configured: { setup: undefined, verify: undefined },
+        devcontainer,
+        agentsMd,
+        detected,
+      }),
+    ).toEqual({
+      setup: ['npm ci && npx playwright install'],
+      verify: ['npm run lint', 'npm test'],
+      sources: { setup: 'devcontainer', verify: 'AGENTS.md' },
+    });
+    // lockkeeper.yml wins, even when it says "nothing".
+    expect(
+      resolveCommands({ configured: { setup: [], verify: ['make check'] }, agentsMd, detected }),
+    ).toEqual({
+      setup: [],
+      verify: ['make check'],
+      sources: { setup: 'lockkeeper.yml', verify: 'lockkeeper.yml' },
+    });
+  });
+});
+
+describe('test files and test commands (E5)', () => {
+  it('recognises test files across common layouts', () => {
+    for (const path of [
+      'test/cart.test.js',
+      'src/__tests__/cart.ts',
+      'src/cart.spec.ts',
+      'pkg/cart_test.go',
+      'tests/test_cart.py',
+      'spec/cart_spec.rb',
+      'src/CartTest.java',
+    ])
+      expect(isTestPath(path), path).toBe(true);
+    for (const path of ['src/cart.js', 'testing.md', 'src/contest.ts', 'latest/notes.txt'])
+      expect(isTestPath(path), path).toBe(false);
+  });
+
+  it('picks the commands that run tests', () => {
+    expect(testCommands(['npm run lint', 'npm test'])).toEqual(['npm test']);
+    expect(testCommands(['make check'])).toEqual(['make check']);
+    expect(testCommands([])).toEqual([]);
   });
 });
