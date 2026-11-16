@@ -211,7 +211,16 @@ export async function stopAgent(sandbox: SandboxHandle, files: AgentFiles): Prom
   );
 }
 
+/** Whether this round's agent was started: its session file exists. */
+export async function agentStarted(sandbox: SandboxHandle, files: AgentFiles): Promise<boolean> {
+  const check = await sandbox.exec(`test -s ${q(files.pid)}`, { timeoutMs: 30_000 });
+  return check.exitCode === 0;
+}
+
 type ResultEvent = Extract<AgentEvent, { type: 'result' }>;
+
+/** `cancel` stops the agent. `detach` leaves it running for a later process to pick up. */
+export type StopRequest = boolean | 'cancel' | 'detach';
 
 export interface WatchOptions {
   adapter: AgentAdapter;
@@ -221,13 +230,20 @@ export interface WatchOptions {
   pollMs: number;
   keepAliveEveryMs: number;
   sandboxTimeoutMs: number;
+  /**
+   * Bytes of the event file a previous process already passed to `onEvent`. They are
+   * read again, to find a result that was missed, but not passed on twice.
+   */
+  skipBytes?: number;
+  /** Called with the bytes read so far, so a restarted process can carry on from there. */
+  onProgress?: (offset: number) => void;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
-  shouldStop?: () => boolean | Promise<boolean>;
+  shouldStop?: () => StopRequest | Promise<StopRequest>;
 }
 
 export interface WatchResult {
-  stopped: 'exited' | 'deadline' | 'cancelled';
+  stopped: 'exited' | 'deadline' | 'cancelled' | 'detached';
   exitCode: number | null;
   result: ResultEvent | undefined;
   stderr: string;
@@ -242,16 +258,20 @@ export async function watchAgent(
 ): Promise<WatchResult> {
   const now = options.now ?? Date.now;
   const sleep = options.sleep ?? defaultSleep;
+  const skip = options.skipBytes ?? 0;
   let offset = 0;
   let lastKeepAlive = now();
   let result: ResultEvent | undefined;
 
-  const consume = (text: string) => {
+  const consume = (text: string, start: number) => {
+    let position = start;
     for (const line of text.split('\n')) {
+      const end = position + Buffer.byteLength(line, 'utf8') + 1;
       for (const event of options.adapter.parseLine(line)) {
         if (event.type === 'result') result = event;
-        options.onEvent(event);
+        if (end > skip) options.onEvent(event);
       }
+      position = end;
     }
   };
   const finish = async (
@@ -276,11 +296,12 @@ export async function watchAgent(
     const lastNewline = data.lastIndexOf('\n');
     if (lastNewline >= 0) {
       const complete = data.slice(0, lastNewline + 1);
+      consume(complete, offset);
       offset += Buffer.byteLength(complete, 'utf8');
-      consume(complete);
+      options.onProgress?.(offset);
     }
     if (exitText !== '') {
-      consume(data.slice(lastNewline + 1));
+      consume(data.slice(lastNewline + 1), offset);
       await stopAgent(sandbox, files);
       const code = Number.parseInt(exitText, 10);
       return finish('exited', Number.isNaN(code) ? null : code);
@@ -289,7 +310,9 @@ export async function watchAgent(
       await stopAgent(sandbox, files);
       return finish('deadline', null);
     }
-    if (await options.shouldStop?.()) {
+    const stop = await options.shouldStop?.();
+    if (stop === 'detach') return { stopped: 'detached', exitCode: null, result, stderr: '' };
+    if (stop === true || stop === 'cancel') {
       await stopAgent(sandbox, files);
       return finish('cancelled', null);
     }

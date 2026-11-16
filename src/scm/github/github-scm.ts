@@ -3,6 +3,7 @@ import { Octokit } from '@octokit/rest';
 import { LockkeeperError } from '../../core/errors.js';
 import {
   type BaseRef,
+  type BranchHead,
   type CloneAccess,
   type CommitInput,
   type CommitResult,
@@ -166,6 +167,27 @@ export class GitHubSourceControl implements SourceControl {
       return true;
     } catch (error) {
       if (statusOf(error) === 404) return false;
+      throw error;
+    }
+  }
+
+  async branchHead(repo: string, branch: string): Promise<BranchHead | undefined> {
+    const { owner, name } = parseRepo(repo);
+    const client = await this.client(repo);
+    try {
+      const { data: ref } = await client.rest.git.getRef({
+        owner,
+        repo: name,
+        ref: `heads/${branch}`,
+      });
+      const { data: commit } = await client.rest.git.getCommit({
+        owner,
+        repo: name,
+        commit_sha: ref.object.sha,
+      });
+      return { sha: commit.sha, message: commit.message };
+    } catch (error) {
+      if (statusOf(error) === 404) return undefined;
       throw error;
     }
   }

@@ -12,6 +12,7 @@ import { AlreadyActiveError } from '../core/errors.js';
 export const RUN_STATES = [
   'queued',
   'snapshot',
+  'readiness',
   'sandbox',
   'clone',
   'setup',
@@ -26,12 +27,32 @@ export const RUN_STATES = [
   'failed',
   'cancelled',
   'refused',
+  'declined',
 ] as const;
 
 export type RunState = (typeof RUN_STATES)[number];
 
 /** States in which a run no longer owns its ticket. */
-export const FINISHED_STATES: readonly RunState[] = ['done', 'failed', 'cancelled', 'refused'];
+export const FINISHED_STATES: readonly RunState[] = [
+  'done',
+  'failed',
+  'cancelled',
+  'refused',
+  'declined',
+];
+
+/** States in which a run owns its ticket but waits for a person: answers or a review. */
+export const PARKED_STATES: readonly RunState[] = ['needs_info', 'in_review'];
+
+/** States in which a process is working on the run. Only these hold a lease. */
+export const EXECUTING_STATES: readonly RunState[] = RUN_STATES.filter(
+  (state) =>
+    state !== 'queued' && !FINISHED_STATES.includes(state) && !PARKED_STATES.includes(state),
+);
+
+export function isExecuting(state: RunState): boolean {
+  return EXECUTING_STATES.includes(state);
+}
 
 export interface RunRecord {
   id: string;
@@ -57,15 +78,50 @@ export interface RunRecord {
   createdAt: string;
   updatedAt: string;
   finishedAt: string | null;
+  /** When a process first started working on the run. The time limit counts from here. */
+  startedAt: string | null;
+  /** The agent round in progress: 0 for the first, then one per fix round. */
+  round: number | null;
+  fixRounds: number | null;
+  /** Bytes of the current round's event file already read and logged. */
+  agentOffset: number | null;
+  /** The process working on the run, and until when its claim holds. */
+  owner: string | null;
+  leaseUntil: string | null;
+  dryRun: boolean;
+  /** JSON: who started the run and how, such as the label change that triggered it. */
+  triggerInfo: string | null;
+  /** The newest ticket comment already checked for `/agent` commands. */
+  commentsSeen: string | null;
+  /** The run this one continues, after answers or a retry. */
+  parentRunId: string | null;
+  /** Extra guidance for the agent, from `/agent retry`. */
+  hint: string | null;
 }
 
 export type NewRun = Pick<
   RunRecord,
   'ticketKey' | 'tracker' | 'repo' | 'baseBranch' | 'workflow' | 'agent'
 > &
-  Partial<Pick<RunRecord, 'triggeredBy' | 'state'>>;
+  Partial<
+    Pick<
+      RunRecord,
+      | 'triggeredBy'
+      | 'state'
+      | 'owner'
+      | 'leaseUntil'
+      | 'dryRun'
+      | 'triggerInfo'
+      | 'commentsSeen'
+      | 'parentRunId'
+      | 'hint'
+      | 'branch'
+    >
+  >;
 
-export type RunPatch = Partial<Omit<RunRecord, 'id' | 'ticketKey' | 'createdAt' | 'updatedAt'>>;
+export type RunPatch = Partial<
+  Omit<RunRecord, 'id' | 'ticketKey' | 'createdAt' | 'updatedAt' | 'dryRun'>
+>;
 
 export interface AuditEvent {
   id: number;
@@ -99,11 +155,25 @@ const COLUMNS: Record<keyof RunRecord, string> = {
   createdAt: 'created_at',
   updatedAt: 'updated_at',
   finishedAt: 'finished_at',
+  startedAt: 'started_at',
+  round: 'round',
+  fixRounds: 'fix_rounds',
+  agentOffset: 'agent_offset',
+  owner: 'owner',
+  leaseUntil: 'lease_until',
+  dryRun: 'dry_run',
+  triggerInfo: 'trigger_info',
+  commentsSeen: 'comments_seen',
+  parentRunId: 'parent_run_id',
+  hint: 'hint',
 };
 
-const finishedList = FINISHED_STATES.map((state) => `'${state}'`).join(', ');
+const sqlList = (states: readonly RunState[]) => states.map((state) => `'${state}'`).join(', ');
+const finishedList = sqlList(FINISHED_STATES);
+const executingList = sqlList(EXECUTING_STATES);
 
-const MIGRATIONS: string[] = [
+// Migrations are append-only: never edit one that has shipped.
+export const MIGRATIONS: readonly string[] = [
   `
   CREATE TABLE runs (
     id TEXT PRIMARY KEY,
@@ -132,7 +202,7 @@ const MIGRATIONS: string[] = [
   );
   -- T6: at most one run per ticket that has not finished.
   CREATE UNIQUE INDEX runs_one_active_per_ticket ON runs (ticket_key)
-    WHERE state NOT IN (${finishedList});
+    WHERE state NOT IN ('done', 'failed', 'cancelled', 'refused');
   CREATE INDEX runs_created_at ON runs (created_at);
   CREATE TABLE events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -142,6 +212,24 @@ const MIGRATIONS: string[] = [
     data TEXT NOT NULL
   );
   CREATE INDEX events_run_id ON events (run_id, id);
+  `,
+  // M2: runs resume after a restart, under a lease, and remember their trigger.
+  `
+  ALTER TABLE runs ADD COLUMN started_at TEXT;
+  ALTER TABLE runs ADD COLUMN round INTEGER;
+  ALTER TABLE runs ADD COLUMN fix_rounds INTEGER;
+  ALTER TABLE runs ADD COLUMN agent_offset INTEGER;
+  ALTER TABLE runs ADD COLUMN owner TEXT;
+  ALTER TABLE runs ADD COLUMN lease_until TEXT;
+  ALTER TABLE runs ADD COLUMN dry_run INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE runs ADD COLUMN trigger_info TEXT;
+  ALTER TABLE runs ADD COLUMN comments_seen TEXT;
+  ALTER TABLE runs ADD COLUMN parent_run_id TEXT;
+  ALTER TABLE runs ADD COLUMN hint TEXT;
+  DROP INDEX runs_one_active_per_ticket;
+  CREATE UNIQUE INDEX runs_one_active_per_ticket ON runs (ticket_key)
+    WHERE state NOT IN ('done', 'failed', 'cancelled', 'refused', 'declined');
+  CREATE INDEX runs_state ON runs (state);
   `,
 ];
 
@@ -154,7 +242,13 @@ type Row = Record<string, SQLInputValue>;
 function toRecord(row: Row): RunRecord {
   const record = {} as Record<string, unknown>;
   for (const [key, column] of Object.entries(COLUMNS)) record[key] = row[column] ?? null;
+  record.dryRun = row.dry_run === 1;
   return record as unknown as RunRecord;
+}
+
+function toParam(value: unknown): SQLInputValue {
+  if (typeof value === 'boolean') return value ? 1 : 0;
+  return (value ?? null) as SQLInputValue;
 }
 
 export class Store {
@@ -203,7 +297,7 @@ export class Store {
       agent: input.agent,
       state: input.state ?? 'queued',
       triggeredBy: input.triggeredBy ?? null,
-      branch: null,
+      branch: input.branch ?? null,
       baseSha: null,
       headSha: null,
       sandboxId: null,
@@ -217,11 +311,22 @@ export class Store {
       createdAt: timestamp,
       updatedAt: timestamp,
       finishedAt: null,
+      startedAt: null,
+      round: null,
+      fixRounds: null,
+      agentOffset: null,
+      owner: input.owner ?? null,
+      leaseUntil: input.leaseUntil ?? null,
+      dryRun: input.dryRun ?? false,
+      triggerInfo: input.triggerInfo ?? null,
+      commentsSeen: input.commentsSeen ?? null,
+      parentRunId: input.parentRunId ?? null,
+      hint: input.hint ?? null,
     };
     const columns = Object.values(COLUMNS);
     const params: Row = {};
     for (const [key, column] of Object.entries(COLUMNS)) {
-      params[column] = record[key as keyof RunRecord] as SQLInputValue;
+      params[column] = toParam(record[key as keyof RunRecord]);
     }
     try {
       this.db
@@ -251,20 +356,72 @@ export class Store {
     return row ? toRecord(row) : undefined;
   }
 
-  countActiveRuns(): number {
+  /** Runs that hold a sandbox or are about to: the ones the parallel-run cap counts (E7). */
+  countExecutingRuns(): number {
     const row = this.db
-      .prepare(
-        `SELECT COUNT(*) AS n FROM runs WHERE state NOT IN (${finishedList}, 'in_review', 'needs_info')`,
-      )
+      .prepare(`SELECT COUNT(*) AS n FROM runs WHERE state IN (${executingList})`)
       .get() as { n: number };
     return row.n;
+  }
+
+  /** Runs in a given state, oldest first. */
+  runsInState(state: RunState, limit = 100): RunRecord[] {
+    const rows = this.db
+      .prepare('SELECT * FROM runs WHERE state = ? ORDER BY created_at LIMIT ?')
+      .all(state, limit) as Row[];
+    return rows.map(toRecord);
+  }
+
+  /** Every run that still owns its ticket, oldest first. */
+  activeRuns(): RunRecord[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM runs WHERE state NOT IN (${finishedList}) ORDER BY created_at`)
+      .all() as Row[];
+    return rows.map(toRecord);
+  }
+
+  /** Executing runs whose process stopped renewing its lease, as after a crash or restart. */
+  orphanedRuns(now = new Date()): RunRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM runs WHERE state IN (${executingList}) AND (lease_until IS NULL OR lease_until < ?) ORDER BY created_at`,
+      )
+      .all(now.toISOString()) as Row[];
+    return rows.map(toRecord);
+  }
+
+  /**
+   * Take the lease on a run unless another process holds a live one. Atomic, so two
+   * processes sharing the file can never both work on one run.
+   */
+  acquireLease(id: string, owner: string, until: Date, now = new Date()): boolean {
+    const result = this.db
+      .prepare(
+        'UPDATE runs SET owner = ?, lease_until = ?, updated_at = ? WHERE id = ? AND (owner IS NULL OR owner = ? OR lease_until IS NULL OR lease_until < ?)',
+      )
+      .run(owner, until.toISOString(), now.toISOString(), id, owner, now.toISOString());
+    return Number(result.changes) === 1;
+  }
+
+  /** Extend this process's lease. False when another process has taken the run over. */
+  renewLease(id: string, owner: string, until: Date): boolean {
+    const result = this.db
+      .prepare('UPDATE runs SET lease_until = ? WHERE id = ? AND owner = ?')
+      .run(until.toISOString(), id, owner);
+    return Number(result.changes) === 1;
+  }
+
+  releaseLease(id: string, owner: string): void {
+    this.db
+      .prepare('UPDATE runs SET owner = NULL, lease_until = NULL WHERE id = ? AND owner = ?')
+      .run(id, owner);
   }
 
   updateRun(id: string, patch: RunPatch, now = new Date()): RunRecord {
     const entries = Object.entries(patch).filter(([, value]) => value !== undefined);
     const sets = entries.map(([key]) => `${COLUMNS[key as keyof RunRecord]} = :${key}`);
     const params: Row = { id, updatedAt: now.toISOString() };
-    for (const [key, value] of entries) params[key] = value as SQLInputValue;
+    for (const [key, value] of entries) params[key] = toParam(value);
     this.db
       .prepare(`UPDATE runs SET ${[...sets, 'updated_at = :updatedAt'].join(', ')} WHERE id = :id`)
       .run(params);
@@ -287,6 +444,14 @@ export class Store {
     this.db
       .prepare('INSERT INTO events (run_id, ts, kind, data) VALUES (?, ?, ?, ?)')
       .run(runId, now.toISOString(), kind, JSON.stringify(data ?? null));
+  }
+
+  /** The data of the newest event of one kind, or undefined. */
+  latestEvent<T = unknown>(runId: string, kind: string): T | undefined {
+    const row = this.db
+      .prepare('SELECT data FROM events WHERE run_id = ? AND kind = ? ORDER BY id DESC LIMIT 1')
+      .get(runId, kind) as { data: string } | undefined;
+    return row ? (JSON.parse(row.data) as T) : undefined;
   }
 
   events(runId: string, options: { kind?: string; limit?: number } = {}): AuditEvent[] {

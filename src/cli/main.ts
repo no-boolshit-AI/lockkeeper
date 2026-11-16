@@ -54,7 +54,7 @@ program
       interrupts += 1;
       if (interrupts > 1) process.exit(130);
       log.warn('Stopping the run (press Ctrl-C again to quit at once)…');
-      controller.abort();
+      controller.abort('The run was stopped from the command line.');
     };
     process.on('SIGINT', onSignal);
     process.on('SIGTERM', onSignal);
@@ -86,6 +86,11 @@ function printResult(result: RunResult): void {
       break;
     case 'refused':
       out(`Not started: ${result.reason}`);
+      break;
+    case 'detached':
+      out(
+        `Stopped in the ${result.run.state} step. Run the same command again to continue where it left off.`,
+      );
       break;
     case 'failed': {
       const hint =

@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -6,7 +6,7 @@ import type { AgentAdapter, SandboxRequirement } from '../../src/agent/agent.js'
 import { ClaudeCodeAdapter } from '../../src/agent/claude-code.js';
 import { docToPlainText } from '../../src/core/doc.js';
 import { AlreadyActiveError, type CapExceededError } from '../../src/core/errors.js';
-import { type ModelKey, type RunDeps, runTicket } from '../../src/engine/run.js';
+import { type ModelKey, type RunDeps, resumeRun, runTicket } from '../../src/engine/run.js';
 import { Store } from '../../src/store/store.js';
 import type { TicketSnapshot } from '../../src/tracker/tracker.js';
 import {
@@ -39,6 +39,8 @@ interface AgentStep {
   text?: string;
   subtype?: string;
   costUsd?: number;
+  /** How long the fake agent works before it reports, after writing its files. */
+  sleepMs?: number;
 }
 
 interface AgentCall {
@@ -408,6 +410,35 @@ describe('runTicket', () => {
     expect(h.sandbox().destroyed).toBe(true);
   });
 
+  it('stops within seconds when cancelled, and says so without a notification', async () => {
+    h = harness({
+      rounds: [{ writes: { 'hello.txt': 'hello\n' }, text: report(), sleepMs: 5_000 }],
+    });
+    const controller = new AbortController();
+    const pending = runTicket(h.deps, {
+      ticketKey: 'DEMO-1',
+      triggeredBy: 'test',
+      signal: controller.signal,
+    });
+    await waitFor(() => agentEvents(h).length > 0);
+    const stoppedAt = Date.now();
+    controller.abort('Maria asked to stop with /agent stop.');
+    const result = await pending;
+
+    expect(Date.now() - stoppedAt).toBeLessThan(2_000);
+    expect(result.outcome).toBe('failed');
+    expect(result.run.state).toBe('cancelled');
+    const comments = h.comments();
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toContain('Maria asked to stop');
+    expect(h.tracker.writes).toContainEqual({
+      action: 'updateLabels',
+      key: 'DEMO-1',
+      change: { remove: ['agent-working', 'agent'] },
+    });
+    expect(h.sandbox().destroyed).toBe(true);
+  });
+
   it('uses the bugfix workflow and passes base-branch instructions to the agent', async () => {
     h = harness({
       files: { 'README.md': '# Demo\n', 'AGENTS.md': 'Use tabs for indentation.\n' },
@@ -429,3 +460,181 @@ describe('runTicket', () => {
     expect(h.scm.pullRequests[0]?.draft).toBe(true);
   });
 });
+
+describe('resuming after a restart', () => {
+  let h: Harness | undefined;
+
+  afterEach(async () => {
+    if (!h) return;
+    // Let a detached fake agent finish before its folder is removed.
+    const home = h.sandboxes.sandboxes[0]?.homeDir;
+    if (home) {
+      const exit = join(home, '.lockkeeper', 'agent-0', 'exit_code');
+      await waitFor(() => existsSync(exit)).catch(() => undefined);
+    }
+    h.store.close();
+    rmSync(h.root, { recursive: true, force: true });
+    h = undefined;
+  });
+
+  it('picks up a run while its agent is still working, without starting it twice', async () => {
+    h = harness({
+      rounds: [{ writes: { 'hello.txt': 'hello\n' }, text: report(), sleepMs: 1_500 }],
+    });
+    const detach = new AbortController();
+    const pending = runTicket(h.deps, {
+      ticketKey: 'DEMO-1',
+      triggeredBy: 'test',
+      detach: detach.signal,
+    });
+    await waitFor(() => agentEvents(h).length > 0);
+    detach.abort();
+    const stopped = await pending;
+
+    expect(stopped.outcome).toBe('detached');
+    expect(stopped.run.state).toBe('implement');
+    expect(h.store.getRun(stopped.run.id)).toMatchObject({ owner: null, leaseUntil: null });
+    expect(h.sandbox().paused).toBe(true);
+    expect(h.comments()).toHaveLength(1);
+
+    // The same command again continues the run instead of refusing or starting over.
+    const resumed = await runTicket(h.deps, { ticketKey: 'DEMO-1', triggeredBy: 'test' });
+    expect(resumed.outcome).toBe('pr');
+    expect(resumed.run.id).toBe(stopped.run.id);
+    expect(h.scm.commits).toHaveLength(1);
+    expect(h.sandboxes.sandboxes).toHaveLength(1);
+    expect(existsSync(join(h.sandbox().homeDir, '.fake-agent-call-1.json'))).toBe(false);
+    const kinds = h.store.events(stopped.run.id).map((event) => event.kind);
+    expect(kinds).toEqual(expect.arrayContaining(['detached', 'resumed', 'agent_reattach']));
+    // Events logged before the restart are not logged twice.
+    const sessions = agentEvents(h).filter((data) => data.type === 'session');
+    expect(sessions).toHaveLength(1);
+    expect(h.comments()).toHaveLength(2);
+  });
+
+  it('never makes a second commit when it restarts right after committing', async () => {
+    h = harness({ rounds: [{ writes: { 'hello.txt': 'hello\n' }, text: report() }] });
+    const detach = new AbortController();
+    const scm = h.scm;
+    scm.afterWrite = (action) => {
+      if (action !== 'commit') return;
+      scm.afterWrite = undefined;
+      detach.abort();
+      throw new Error('The connection dropped.');
+    };
+    const stopped = await runTicket(h.deps, {
+      ticketKey: 'DEMO-1',
+      triggeredBy: 'test',
+      detach: detach.signal,
+    });
+    expect(stopped.outcome).toBe('detached');
+    expect(h.store.getRun(stopped.run.id)).toMatchObject({ state: 'publish', headSha: null });
+
+    const resumed = await resumeRun(h.deps, stopped.run.id);
+    expect(resumed?.outcome).toBe('pr');
+    expect(scm.commits).toHaveLength(1);
+    expect(scm.pullRequests).toHaveLength(1);
+    expect(h.store.getRun(stopped.run.id)?.headSha).toBe('c'.repeat(40));
+  });
+
+  it('never opens a second pull request or final comment when it restarts after opening one', async () => {
+    h = harness({ rounds: [{ writes: { 'hello.txt': 'hello\n' }, text: report() }] });
+    const detach = new AbortController();
+    const scm = h.scm;
+    scm.afterWrite = (action) => {
+      if (action !== 'pull_request') return;
+      scm.afterWrite = undefined;
+      detach.abort();
+      throw new Error('The connection dropped.');
+    };
+    const stopped = await runTicket(h.deps, {
+      ticketKey: 'DEMO-1',
+      triggeredBy: 'test',
+      detach: detach.signal,
+    });
+    expect(stopped.outcome).toBe('detached');
+
+    const resumed = await resumeRun(h.deps, stopped.run.id);
+    expect(resumed?.outcome).toBe('pr');
+    expect(scm.pullRequests).toHaveLength(1);
+    expect(h.comments()).toHaveLength(2);
+    expect(await resumeRun(h.deps, stopped.run.id)).toBeUndefined();
+  });
+
+  it('fails clearly when the sandbox of an interrupted run is gone', async () => {
+    h = harness({
+      rounds: [{ writes: { 'hello.txt': 'hello\n' }, text: report(), sleepMs: 1_000 }],
+    });
+    const detach = new AbortController();
+    const pending = runTicket(h.deps, {
+      ticketKey: 'DEMO-1',
+      triggeredBy: 'test',
+      detach: detach.signal,
+    });
+    await waitFor(() => agentEvents(h).length > 0);
+    detach.abort();
+    const stopped = await pending;
+
+    const elsewhere = new LocalSandboxProvider({ root: h.root, binDir: join(h.root, 'bin') });
+    const resumed = await resumeRun({ ...h.deps, sandboxes: elsewhere }, stopped.run.id);
+    expect(resumed?.outcome).toBe('failed');
+    expect(resumed?.run.state).toBe('failed');
+    expect(h.comments()[0]).toContain('is gone');
+  });
+
+  it('does not let a dry run replace a real run that stopped', async () => {
+    h = harness({ rounds: [{ writes: { 'hello.txt': 'hello\n' }, text: report() }] });
+    const orphan = h.store.createRun({
+      ticketKey: 'DEMO-1',
+      tracker: 'jira-cloud',
+      repo: 'acme/demo',
+      baseBranch: 'main',
+      workflow: 'feature',
+      agent: 'claude-code',
+      state: 'implement',
+    });
+    const attempt = runTicket(h.deps, { ticketKey: 'DEMO-1', triggeredBy: 'test', dryRun: true });
+    await expect(attempt).rejects.toThrow(AlreadyActiveError);
+    await attempt.catch((error: AlreadyActiveError) => {
+      expect(error.hint).toContain('without --dry-run');
+    });
+    expect(h.store.getRun(orphan.id)).toMatchObject({ state: 'implement', owner: null });
+  });
+
+  it('leaves a run alone while another process holds it', async () => {
+    h = harness({ rounds: [{ writes: { 'hello.txt': 'hello\n' }, text: report() }] });
+    const held = h.store.createRun({
+      ticketKey: 'DEMO-1',
+      tracker: 'jira-cloud',
+      repo: 'acme/demo',
+      baseBranch: 'main',
+      workflow: 'feature',
+      agent: 'claude-code',
+      state: 'implement',
+      owner: 'another-host:123:abc',
+      leaseUntil: new Date(Date.now() + 60_000).toISOString(),
+    });
+    const attempt = runTicket(h.deps, { ticketKey: 'DEMO-1', triggeredBy: 'test' });
+    await expect(attempt).rejects.toThrow(AlreadyActiveError);
+    await attempt.catch((error: AlreadyActiveError) => {
+      expect(error.hint).toContain('Another Lockkeeper process');
+    });
+    expect(await resumeRun(h.deps, held.id)).toBeUndefined();
+    expect(h.sandboxes.sandboxes).toHaveLength(0);
+  });
+});
+
+async function waitFor(condition: () => boolean, timeoutMs = 10_000): Promise<void> {
+  const started = Date.now();
+  while (!condition()) {
+    if (Date.now() - started > timeoutMs) throw new Error('Timed out waiting for a condition.');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+/** The agent events the run has logged so far, for the ticket's active or latest run. */
+function agentEvents(h: Harness | undefined): { type: string }[] {
+  const run = h?.store.listRuns({ ticketKey: 'DEMO-1', limit: 1 })[0];
+  if (!h || !run) return [];
+  return h.store.events(run.id, { kind: 'agent' }).map((event) => event.data as { type: string });
+}

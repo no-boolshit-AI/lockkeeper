@@ -1,4 +1,5 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { hostname } from 'node:os';
 import type { AgentAdapter, AgentEvent, KeyPlacement } from '../agent/agent.js';
 import {
   type Config,
@@ -9,6 +10,7 @@ import {
 import { branchName, titleFor, type WorkflowName, workflowFor } from '../core/branch.js';
 import { docToMarkdown, docToPlainText } from '../core/doc.js';
 import {
+  AlreadyActiveError,
   CapExceededError,
   ConfigError,
   LockkeeperError,
@@ -20,8 +22,8 @@ import { type Logger, silentLogger } from '../core/log.js';
 import { checkContents, checkDiff, type PolicyResult } from '../policy/diff-policy.js';
 import { redactSecrets } from '../policy/secrets.js';
 import type { SandboxHandle, SandboxProvider, SecretBinding } from '../sandbox/sandbox.js';
-import type { PullRequest, SourceControl } from '../scm/scm.js';
-import type { RunRecord, RunState, Store } from '../store/store.js';
+import type { BaseRef, PullRequest, SourceControl } from '../scm/scm.js';
+import { isExecuting, type RunRecord, type RunState, type Store } from '../store/store.js';
 import { RecordingTracker } from '../tracker/recording-tracker.js';
 import type { TicketSnapshot, Tracker } from '../tracker/tracker.js';
 import { detectCommands } from './detect.js';
@@ -31,6 +33,7 @@ import {
   buildFixPrompt,
   buildSystemPrompt,
   buildTaskPrompt,
+  type InstructionFile,
   matchCriteria,
   parseAgentReport,
   stripReport,
@@ -50,6 +53,7 @@ import {
 } from './report.js';
 import {
   agentFiles,
+  agentStarted,
   type CheckResult,
   type CollectedChanges,
   cloneRepo,
@@ -59,6 +63,7 @@ import {
   layoutFor,
   readInstructionFiles,
   runCommands,
+  type StopRequest,
   startAgent,
   tail,
   watchAgent,
@@ -94,7 +99,10 @@ export interface RunRequest {
   triggeredBy: string;
   /** Run everything, but write nothing to Jira or GitHub. */
   dryRun?: boolean;
+  /** Stop the run and report it as stopped. A string reason is shown on the ticket. */
   signal?: AbortSignal;
+  /** Stop working but keep the run, so it resumes when Lockkeeper starts again. */
+  detach?: AbortSignal;
 }
 
 export interface DryRunPreview {
@@ -113,44 +121,190 @@ export type RunResult =
   | { outcome: 'no_changes'; run: RunRecord }
   | { outcome: 'refused'; run: RunRecord; reason: string }
   | { outcome: 'failed'; run: RunRecord; error: Error }
-  | { outcome: 'dry_run'; run: RunRecord; preview: DryRunPreview };
+  | { outcome: 'dry_run'; run: RunRecord; preview: DryRunPreview }
+  | { outcome: 'detached'; run: RunRecord };
 
 const PLACEHOLDER_KEY = 'lockkeeper-key-added-by-egress-proxy';
 const MAX_SANDBOX_MS = 60 * 60_000;
 const MIN_FIX_ROUND_USD = 0.5;
 const MIN_FIX_ROUND_MS = 3 * 60_000;
 
-/** Turn a ticket into a pull request: the walking skeleton's whole loop, start to finish. */
-export async function runTicket(deps: RunDeps, request: RunRequest): Promise<RunResult> {
-  const key = request.ticketKey.trim().toUpperCase();
-  if (!/^[A-Z][A-Z0-9_]+-\d+$/.test(key))
-    throw new ConfigError(`Not a Jira issue key: ${request.ticketKey}`);
+/** How long a process's claim on a run lasts without renewal. */
+export const LEASE_MS = 90_000;
+
+/** This process, as the owner of the runs it works on. */
+export const PROCESS_OWNER = `${hostname()}:${process.pid}:${randomBytes(3).toString('hex')}`;
+
+/** States in which the sandbox already holds the cloned and set-up repository. */
+const PREPARED: ReadonlySet<RunState> = new Set([
+  'implement',
+  'verify',
+  'collect',
+  'publish',
+  'report',
+]);
+/** States in which the agent's work is finished and saved as an `implemented` event. */
+const IMPLEMENTED: ReadonlySet<RunState> = new Set(['collect', 'publish', 'report']);
+
+/** Thrown inside a run to stop without reporting, leaving it for a later process. */
+class RunDetachedError extends Error {}
+
+interface PromptRecord {
+  round: number;
+  system?: string;
+  prompt: string;
+}
+
+/** What the agent rounds produced, saved so a restarted run can publish it. */
+interface Work {
+  finalText: string;
+  report?: AgentReport;
+  checks: CheckResult[];
+  draftReasons: string[];
+}
+
+function normalizeKey(input: string): string {
+  const key = input.trim().toUpperCase();
+  if (!/^[A-Z][A-Z0-9_]+-\d+$/.test(key)) throw new ConfigError(`Not a Jira issue key: ${input}`);
+  return key;
+}
+
+function settingsFor(config: Config, key: string): ProjectSettings {
   const projectKey = key.slice(0, key.lastIndexOf('-'));
-  const settings = projectSettings(deps.config, projectKey);
+  const settings = projectSettings(config, projectKey);
   if (!settings) {
     throw new RunRefusedError(
       `Project ${projectKey} is not configured.`,
       `Add it under projects: in lockkeeper.yml.`,
     );
   }
-  const active = deps.store.countActiveRuns();
-  if (active >= deps.config.limits.parallel_runs) {
+  return settings;
+}
+
+const leaseEnd = (now: number) => new Date(now + LEASE_MS);
+
+function activeHint(run: RunRecord): string {
+  switch (run.state) {
+    case 'needs_info':
+      return `It is waiting for answers on the ticket. Reply \`/agent go\` there, or run \`lockkeeper cancel ${run.ticketKey}\`.`;
+    case 'in_review':
+      return `Its pull request is in review. Run \`lockkeeper cancel ${run.ticketKey}\` to release the ticket.`;
+    case 'queued':
+      return 'It is waiting for a free run slot.';
+    default:
+      return 'Another Lockkeeper process is working on it.';
+  }
+}
+
+function cancelReason(signal: AbortSignal | undefined): string {
+  return typeof signal?.reason === 'string' && signal.reason
+    ? signal.reason
+    : 'The run was stopped.';
+}
+
+/**
+ * Turn a ticket into a pull request. If the ticket's run was cut short by a crash or a
+ * restart, this picks it up where it stopped instead of starting a second one (T6).
+ */
+export async function runTicket(deps: RunDeps, request: RunRequest): Promise<RunResult> {
+  const key = normalizeKey(request.ticketKey);
+  const settings = settingsFor(deps.config, key);
+  const nowMs = (deps.now ?? Date.now)();
+  const now = new Date(nowMs);
+  const active = deps.store.activeRunFor(key);
+  if (active) {
+    const orphaned =
+      isExecuting(active.state) &&
+      deps.store.acquireLease(active.id, PROCESS_OWNER, leaseEnd(nowMs), now);
+    if (!orphaned) throw new AlreadyActiveError(key, active.id, activeHint(active));
+    if (!active.dryRun) {
+      if (!request.dryRun) {
+        return new TicketRun(deps, { ...request, ticketKey: key }, active, settings).execute();
+      }
+      deps.store.releaseLease(active.id, PROCESS_OWNER);
+      throw new AlreadyActiveError(
+        key,
+        active.id,
+        'Its process stopped. Run the same command without --dry-run to continue it.',
+      );
+    }
+    // A dry run keeps its writes in memory, so it cannot resume. Close it and start over.
+    deps.store.updateRun(
+      active.id,
+      {
+        state: 'failed',
+        error: 'The dry run was interrupted.',
+        finishedAt: now.toISOString(),
+        owner: null,
+        leaseUntil: null,
+      },
+      now,
+    );
+  }
+  const executing = deps.store.countExecutingRuns();
+  if (executing >= deps.config.limits.parallel_runs) {
     throw new CapExceededError(
       'parallel_runs',
-      `${active} runs are already active, the limit for this install (limits.parallel_runs).`,
+      `${executing} runs are already active, the limit for this install (limits.parallel_runs).`,
     );
   }
   // T6: claiming the ticket is the first write, and it fails if a run is active.
-  const run = deps.store.createRun({
-    ticketKey: key,
-    tracker: deps.tracker.kind,
-    repo: settings.repo,
-    baseBranch: settings.baseBranch,
-    workflow: 'feature',
-    agent: deps.agent.id,
-    triggeredBy: request.triggeredBy,
-    state: 'snapshot',
-  });
+  const run = deps.store.createRun(
+    {
+      ticketKey: key,
+      tracker: deps.tracker.kind,
+      repo: settings.repo,
+      baseBranch: settings.baseBranch,
+      workflow: 'feature',
+      agent: deps.agent.id,
+      triggeredBy: request.triggeredBy,
+      state: 'snapshot',
+      owner: PROCESS_OWNER,
+      leaseUntil: leaseEnd(nowMs).toISOString(),
+      dryRun: request.dryRun ?? false,
+    },
+    now,
+  );
+  return new TicketRun(deps, { ...request, ticketKey: key }, run, settings).execute();
+}
+
+/**
+ * Continue a run whose process stopped, as after a restart. Returns undefined when the
+ * run is not executing or another process holds it.
+ */
+export async function resumeRun(
+  deps: RunDeps,
+  runId: string,
+  options: Pick<RunRequest, 'signal' | 'detach'> = {},
+): Promise<RunResult | undefined> {
+  const nowMs = (deps.now ?? Date.now)();
+  const now = new Date(nowMs);
+  const run = deps.store.getRun(runId);
+  if (!run || !isExecuting(run.state)) return undefined;
+  if (!deps.store.acquireLease(run.id, PROCESS_OWNER, leaseEnd(nowMs), now)) return undefined;
+  let settings: ProjectSettings;
+  try {
+    if (run.dryRun) throw new LockkeeperError('The dry run was interrupted.');
+    settings = settingsFor(deps.config, run.ticketKey);
+  } catch (error) {
+    const updated = deps.store.updateRun(
+      run.id,
+      {
+        state: 'failed',
+        error: (error as Error).message,
+        finishedAt: now.toISOString(),
+        owner: null,
+        leaseUntil: null,
+      },
+      now,
+    );
+    return { outcome: 'failed', run: updated, error: error as Error };
+  }
+  const request: RunRequest = {
+    ticketKey: run.ticketKey,
+    triggeredBy: run.triggeredBy ?? 'unknown',
+    ...options,
+  };
   return new TicketRun(deps, request, run, settings).execute();
 }
 
@@ -160,13 +314,17 @@ class TicketRun {
   private readonly tracker: Tracker;
   private readonly startedAt: number;
   private readonly deadline: number;
-  private readonly layoutHome: { layout?: Layout } = {};
   private ticket: TicketSnapshot | undefined;
   private sandbox: SandboxHandle | undefined;
+  private layout: Layout | undefined;
+  private base: BaseRef | undefined;
+  private verify: string[] = [];
+  private instructions: InstructionFile[] = [];
   private statusCommentId: string | undefined;
   private costUsd: number | undefined;
   private turns: number | undefined;
-  private fixRounds = 0;
+  private fixRounds: number;
+  private leaseLost = false;
 
   constructor(
     private readonly deps: RunDeps,
@@ -177,24 +335,60 @@ class TicketRun {
     this.log = deps.log ?? silentLogger;
     this.now = deps.now ?? Date.now;
     this.tracker = request.dryRun ? new RecordingTracker(deps.tracker) : deps.tracker;
-    this.startedAt = this.now();
+    this.statusCommentId = run.statusCommentId ?? undefined;
+    this.costUsd = run.costUsd ?? undefined;
+    this.turns = run.turns ?? undefined;
+    this.fixRounds = run.fixRounds ?? 0;
+    // The time limit counts from the run's first start, including any time it was stopped.
+    this.startedAt = run.startedAt ? Date.parse(run.startedAt) : this.now();
     this.deadline = this.startedAt + deps.config.limits.minutes * 60_000;
   }
 
   async execute(): Promise<RunResult> {
+    const renew = setInterval(() => this.renewLease(), LEASE_MS / 3);
+    renew.unref?.();
+    const onCancel = () => void this.interrupt();
+    this.request.signal?.addEventListener('abort', onCancel, { once: true });
     try {
+      if (!this.run.startedAt) this.update({ startedAt: new Date(this.startedAt).toISOString() });
       return await this.steps();
     } catch (error) {
+      // After a shutdown request, whatever broke is part of shutting down: keep the run.
+      const detaching =
+        error instanceof RunDetachedError ||
+        this.request.detach?.aborted === true ||
+        this.leaseLost;
+      if (detaching && !this.request.signal?.aborted) return await this.detached();
       return await this.fail(error);
+    } finally {
+      clearInterval(renew);
+      this.request.signal?.removeEventListener('abort', onCancel);
+      this.deps.store.releaseLease(this.run.id, PROCESS_OWNER);
     }
   }
 
   // -------------------------------------------------------------------------
+  // The phases. Each one checks what an earlier process already did, so a run
+  // resumed after a restart continues instead of repeating published work.
 
   private async steps(): Promise<RunResult> {
-    const { config, scm, sandboxes, agent } = this.deps;
-    const key = this.run.ticketKey;
+    if (this.run.state === 'queued' || this.run.state === 'snapshot') {
+      const early = await this.begin();
+      if (early) return early;
+    } else {
+      this.restore();
+    }
+    await this.prepare();
+    const work = await this.implementAndVerify();
+    if ('outcome' in work) return work;
+    return await this.collectAndPublish(work);
+  }
 
+  /** Snapshot the ticket (T4), apply the refusal rules (T3, T5) and say so on the ticket. */
+  private async begin(): Promise<RunResult | undefined> {
+    const { config } = this.deps;
+    const key = this.run.ticketKey;
+    this.setState('snapshot');
     this.log.step(`Reading ${key}`);
     const ticket = await this.tracker.snapshot(key);
     this.ticket = ticket;
@@ -221,17 +415,47 @@ class TicketRun {
     }
 
     const ctx = this.context();
-    this.statusCommentId = await this.tracker.postComment(key, pickedUpDoc(ctx));
-    this.update({ statusCommentId: this.statusCommentId });
+    if (this.statusCommentId) {
+      await this.tracker.updateComment(key, this.statusCommentId, pickedUpDoc(ctx));
+    } else {
+      this.statusCommentId = await this.tracker.postComment(key, pickedUpDoc(ctx));
+      this.update({ statusCommentId: this.statusCommentId });
+    }
     await this.tracker.updateLabels(key, {
       add: [config.jira.labels.working],
       remove: [config.jira.labels.trigger],
     });
     this.checkCancelled();
+    return undefined;
+  }
 
-    // Sandbox (E1, E2, E3)
+  /** Load what an earlier process captured, for a run resumed after the snapshot. */
+  private restore(): void {
+    const ticket = this.deps.store.latestEvent<TicketSnapshot>(this.run.id, 'snapshot');
+    if (!ticket) {
+      throw new StepFailedError(this.run.state, 'The run has no ticket snapshot to resume from.');
+    }
+    this.ticket = ticket;
+    this.settings =
+      projectSettings(this.deps.config, this.settings.key, this.run.repo) ?? this.settings;
+    this.log.step(`Resuming ${this.run.ticketKey} in the ${this.run.state} step`);
+    this.audit('resumed', { state: this.run.state, round: this.run.round });
+  }
+
+  /** Sandbox (E1, E2, E3), clone and setup (E6), or reconnect to a prepared sandbox. */
+  private async prepare(): Promise<void> {
+    const { config, scm, sandboxes, agent } = this.deps;
+    const key = this.run.ticketKey;
+    if (this.run.sandboxId && this.run.baseSha && PREPARED.has(this.run.state)) {
+      await this.reconnect(this.run.sandboxId, this.run.baseSha);
+      return;
+    }
+    // A sandbox from a run cut short while preparing is not trusted: start a new one.
+    if (this.run.sandboxId) await this.discardSandbox(this.run.sandboxId);
+
     this.setState('sandbox');
     const base = await scm.resolveBase(this.settings.repo, this.settings.baseBranch);
+    this.base = base;
     this.update({ baseSha: base.sha });
     const secrets: SecretBinding[] = [];
     if (this.deps.modelKey.mode === 'egress') {
@@ -253,6 +477,9 @@ class TicketRun {
       ...(config.sandbox.registries ? { registries: config.sandbox.registries } : {}),
     });
     this.log.step(`Starting a sandbox on ${sandboxes.displayName}`);
+    // A new key per attempt: a retry after a crash reuses the sandbox the crash left
+    // unrecorded, and an attempt after a discarded sandbox gets a fresh one.
+    const attempt = this.deps.store.events(this.run.id, { kind: 'sandbox' }).length + 1;
     const spec = {
       timeoutMs: this.sandboxTimeout(),
       metadata: {
@@ -263,13 +490,13 @@ class TicketRun {
       },
       allowDomains,
       secrets,
-      idempotencyKey: `lockkeeper-${this.run.id}`,
+      idempotencyKey: `lockkeeper-${this.run.id}-${attempt}`,
       ...(config.sandbox.template ? { template: config.sandbox.template } : {}),
     };
     const sandbox = await sandboxes.create(spec);
     this.sandbox = sandbox;
     const layout = layoutFor(sandbox.homeDir);
-    this.layoutHome.layout = layout;
+    this.layout = layout;
     this.update({ sandboxId: sandbox.id });
     this.audit('sandbox', {
       id: sandbox.id,
@@ -306,10 +533,10 @@ class TicketRun {
     this.log.step(`Cloning ${this.settings.repo} at ${base.sha.slice(0, 12)}`);
     const access = await scm.cloneAccess(this.settings.repo);
     await cloneRepo(sandbox, layout, access, base, this.stepTimeout(10 * 60_000));
-    const instructions = await readInstructionFiles(sandbox, layout, base.sha);
+    this.instructions = await readInstructionFiles(sandbox, layout, base.sha);
     this.audit(
       'instructions',
-      instructions.map((file) => ({ path: file.path, bytes: file.content.length })),
+      this.instructions.map((file) => ({ path: file.path, bytes: file.content.length })),
     );
     this.checkCancelled();
 
@@ -324,6 +551,9 @@ class TicketRun {
       verify ??= detected.verify;
       this.audit('detected_commands', detected);
     }
+    this.verify = verify;
+    // Saved, not detected again on resume: by then the agent may have changed the files.
+    this.audit('commands', { setup, verify });
     if (setup.length > 0) {
       this.log.step(`Setting up: ${setup.join(' && ')}`);
       const timeout = this.stepTimeout(config.limits.setup_minutes * 60_000);
@@ -344,48 +574,134 @@ class TicketRun {
       }
     }
     this.checkCancelled();
+  }
 
-    // Implement, verify, fix (E4, E5, V1)
-    const sessionId = randomUUID();
-    this.update({ sessionId, workflow });
-    const system = buildSystemPrompt({ workflow, workdir: layout.repo, verify, instructions });
-    let prompt = buildTaskPrompt(ticket, workflow);
-    this.audit('prompt', { round: 0, system, prompt });
+  private async reconnect(sandboxId: string, baseSha: string): Promise<void> {
+    this.log.step(`Reconnecting to sandbox ${sandboxId}`);
+    try {
+      this.sandbox = await this.deps.sandboxes.connect(sandboxId);
+    } catch (error) {
+      throw new StepFailedError(
+        'sandbox',
+        `The run's sandbox (${sandboxId}) is gone, so the run cannot continue. Label the ticket again to start over.`,
+        (error as Error).message,
+      );
+    }
+    this.layout = layoutFor(this.sandbox.homeDir);
+    this.base = { branch: this.run.baseBranch, sha: baseSha };
+    const commands = this.deps.store.latestEvent<{ verify: string[] }>(this.run.id, 'commands');
+    this.verify = commands?.verify ?? this.settings.verify ?? [];
+    this.instructions = await readInstructionFiles(this.sandbox, this.layout, baseSha);
+    await this.extendSandbox(this.sandboxTimeout());
+  }
 
+  private async discardSandbox(sandboxId: string): Promise<void> {
+    try {
+      const stale = await this.deps.sandboxes.connect(sandboxId);
+      await stale.destroy();
+    } catch (error) {
+      this.log.debug(`Could not delete sandbox ${sandboxId}: ${(error as Error).message}`);
+    }
+    this.audit('sandbox_discarded', { id: sandboxId });
+    this.update({ sandboxId: null });
+  }
+
+  /** Implement, verify, fix (E4, E5, V1). Resumes in the round where it stopped. */
+  private async implementAndVerify(): Promise<Work | RunResult> {
+    if (IMPLEMENTED.has(this.run.state)) {
+      const saved = this.deps.store.latestEvent<Work>(this.run.id, 'implemented');
+      if (!saved) {
+        throw new StepFailedError(
+          this.run.state,
+          'The run has no saved agent result to resume from.',
+        );
+      }
+      return saved;
+    }
+    const { config, agent } = this.deps;
+    const key = this.run.ticketKey;
+    const ticket = this.ticket as TicketSnapshot;
+    const sandbox = this.sandbox as SandboxHandle;
+    const layout = this.layout as Layout;
+    const base = this.base as BaseRef;
+    const verify = this.verify;
+    const workflow = this.run.workflow as WorkflowName;
+    const ctx = this.context();
+
+    let sessionId = this.run.sessionId;
+    if (!sessionId) {
+      sessionId = randomUUID();
+      this.update({ sessionId });
+    }
+    const prompts = this.deps.store
+      .events(this.run.id, { kind: 'prompt' })
+      .map((event) => event.data as PromptRecord);
+    const promptFor = (round: number) => prompts.filter((entry) => entry.round === round).at(-1);
+    const system =
+      promptFor(0)?.system ??
+      buildSystemPrompt({
+        workflow,
+        workdir: layout.repo,
+        verify,
+        instructions: this.instructions,
+      });
+
+    // On resume, start in the round that was running, with what earlier rounds produced.
+    const resuming = this.run.state === 'implement' || this.run.state === 'verify';
+    const firstRound = resuming ? (this.run.round ?? 0) : 0;
+    const verifyFirst = this.run.state === 'verify';
     let report: AgentReport | undefined;
     let finalText = '';
+    for (const event of this.deps.store.events(this.run.id, { kind: 'agent_exit' })) {
+      const exit = event.data as { round: number; text?: string };
+      const done = exit.round < firstRound || (verifyFirst && exit.round === firstRound);
+      if (done && exit.text) {
+        finalText = exit.text;
+        report = parseAgentReport(exit.text) ?? report;
+      }
+    }
+
     let checks: CheckResult[] = [];
     const draftReasons: string[] = [];
-    for (let round = 0; ; round++) {
-      this.setState('implement');
-      await this.progress(
-        ctx,
-        round === 0
-          ? 'the agent is implementing the ticket'
-          : `fix round ${round}: the agent is fixing failed checks`,
-      );
-      this.log.step(
-        round === 0 ? `${agent.displayName} is implementing ${key}` : `Fix round ${round}`,
-      );
-      let text: string;
-      try {
-        text = await this.runAgent(round, { system, prompt, sessionId });
-      } catch (error) {
-        // A cap hit during a fix round keeps the work: it is published as a draft.
-        if (round > 0 && error instanceof CapExceededError) {
-          draftReasons.push(`Fix round ${round} stopped at the ${error.cap} limit.`);
-          break;
+    for (let round = firstRound; ; round++) {
+      if (!(verifyFirst && round === firstRound)) {
+        let prompt = promptFor(round)?.prompt;
+        if (prompt === undefined) {
+          if (round > 0) {
+            throw new StepFailedError('implement', `The prompt for fix round ${round} is missing.`);
+          }
+          prompt = buildTaskPrompt(ticket, workflow);
+          this.audit('prompt', { round: 0, system, prompt });
         }
-        throw error;
-      }
-      finalText = text;
-      report = parseAgentReport(text) ?? report;
+        this.setState('implement', { round });
+        await this.progress(
+          ctx,
+          round === 0
+            ? 'the agent is implementing the ticket'
+            : `fix round ${round}: the agent is fixing failed checks`,
+        );
+        this.log.step(
+          round === 0 ? `${agent.displayName} is implementing ${key}` : `Fix round ${round}`,
+        );
+        let text: string;
+        try {
+          text = await this.runAgent(round, { system, prompt, sessionId });
+        } catch (error) {
+          // A cap hit during a fix round keeps the work: it is published as a draft.
+          if (round > 0 && error instanceof CapExceededError) {
+            draftReasons.push(`Fix round ${round} stopped at the ${error.cap} limit.`);
+            break;
+          }
+          throw error;
+        }
+        finalText = text;
+        report = parseAgentReport(text) ?? report;
 
-      if (round === 0 && !(await this.hasChanges(sandbox, layout, base.sha))) {
-        return this.noChanges(ctx, cleanAgentText(stripReport(finalText), 1_500));
+        if (round === 0 && !(await this.hasChanges(sandbox, layout, base.sha))) {
+          return this.noChanges(ctx, cleanAgentText(stripReport(finalText), 1_500));
+        }
       }
 
-      this.setState('verify');
       await this.progress(ctx, 'Lockkeeper is running the checks');
       if (verify.length === 0) break;
       this.log.step(`Verifying: ${verify.join(', ')}`);
@@ -409,19 +725,36 @@ class TicketRun {
         break;
       }
       this.fixRounds = round + 1;
-      prompt = buildFixPrompt(
-        failures.map((failure) => ({
-          command: failure.command,
-          exitCode: failure.exitCode,
-          output: failure.output,
-        })),
-      );
-      this.audit('prompt', { round: round + 1, prompt });
+      const next: PromptRecord = {
+        round: round + 1,
+        prompt: buildFixPrompt(
+          failures.map((failure) => ({
+            command: failure.command,
+            exitCode: failure.exitCode,
+            output: failure.output,
+          })),
+        ),
+      };
+      this.audit('prompt', next);
+      prompts.push(next);
+      this.update({ fixRounds: this.fixRounds });
     }
     this.checkCancelled();
-
-    // Package and check the result (V2)
+    const work: Work = { finalText, ...(report ? { report } : {}), checks, draftReasons };
+    this.audit('implemented', work);
     this.setState('collect');
+    return work;
+  }
+
+  /** Package and check the result (V2), then publish it. */
+  private async collectAndPublish(work: Work): Promise<RunResult> {
+    const { config } = this.deps;
+    const ticket = this.ticket as TicketSnapshot;
+    const ctx = this.context();
+    const sandbox = this.sandbox as SandboxHandle;
+    const layout = this.layout as Layout;
+    const base = this.base as BaseRef;
+
     this.log.step('Collecting and checking the changes');
     const collected = await collectChanges(sandbox, layout, base.sha);
     const policy = checkContents(
@@ -434,7 +767,7 @@ class TicketRun {
     );
     this.audit('policy', { files: collected.files, findings: policy.findings });
     if (collected.files.length === 0)
-      return this.noChanges(ctx, cleanAgentText(stripReport(finalText), 1_500));
+      return this.noChanges(ctx, cleanAgentText(stripReport(work.finalText), 1_500));
     if (policy.blocked) {
       const blocking = policy.findings.filter((finding) => finding.severity === 'block');
       throw new StepFailedError(
@@ -443,7 +776,8 @@ class TicketRun {
       );
     }
 
-    const summary = cleanAgentText(report?.summary || stripReport(finalText), 1_500);
+    const report = work.report;
+    const summary = cleanAgentText(report?.summary || stripReport(work.finalText), 1_500);
     const risks = (report?.risks ?? [])
       .slice(0, 10)
       .map((risk) => cleanAgentText(risk, 300))
@@ -453,18 +787,21 @@ class TicketRun {
       met: criterion.met,
       evidence: cleanAgentText(criterion.evidence, 300),
     }));
-    draftReasons.unshift(...this.draftReasons(checks, verify, policy, criteria, ticket));
+    const draftReasons = [
+      ...this.draftReasons(work.checks, this.verify, policy, criteria, ticket),
+      ...work.draftReasons,
+    ];
 
     return this.publish({
       ctx,
-      workflow,
+      workflow: this.run.workflow as WorkflowName,
       base,
       collected,
       policy,
       summary,
       risks,
       criteria,
-      checks,
+      checks: work.checks,
       draftReasons,
     });
   }
@@ -509,10 +846,12 @@ class TicketRun {
     const { ctx, collected, policy } = input;
     const key = this.run.ticketKey;
     const ticket = ctx.ticket;
+    const dryRun = this.request.dryRun === true;
 
-    this.setState('publish');
-    await this.progress(ctx, 'Lockkeeper is opening the pull request');
-    const branch = await this.availableBranch(branchName(input.workflow, key, ticket.summary));
+    if (this.run.state !== 'report') {
+      this.setState('publish');
+      await this.progress(ctx, 'Lockkeeper is opening the pull request');
+    }
     const title = titleFor(key, ticket.summary);
     const durationMs = this.now() - this.startedAt;
     const body = capPullRequestBody(
@@ -535,48 +874,75 @@ class TicketRun {
       ),
     );
     const draft = input.draftReasons.length > 0;
-    const dryRun = this.request.dryRun === true;
+    const wantedBranch = branchName(input.workflow, key, ticket.summary);
 
     let pr: PullRequest = { url: '(dry run: no pull request)', number: 0, draft, state: 'none' };
-    if (!dryRun) {
-      // V3: commits and the PR are created here, under the App identity, never in the sandbox.
-      const message = `${title}\n\n${input.summary}\n\nTicket: ${ticket.url}\nLockkeeper-Run: ${this.run.id}\nAgent: ${this.deps.agent.displayName}\n`;
-      const commit = await scm.commit({
-        repo: this.settings.repo,
-        branch,
-        parentSha: input.base.sha,
-        message,
-        changes: collected.changes,
-        createBranch: true,
-      });
-      this.update({ branch, headSha: commit.sha });
-      this.audit('commit', {
-        sha: commit.sha,
-        url: commit.url,
-        verified: commit.verified,
-        branch,
-        paths: collected.files.map((file) => file.path),
-      });
-      this.log.step(`Committed ${commit.sha.slice(0, 12)} to ${branch}`);
-
-      pr = await scm.openPullRequest({
-        repo: this.settings.repo,
-        head: branch,
-        base: this.settings.baseBranch,
-        title,
-        body,
-        draft,
-      });
-      this.update({ prNumber: pr.number, prUrl: pr.url });
-      this.audit('pull_request', pr);
-      this.log.step(`Opened ${pr.draft || draft ? 'draft ' : ''}pull request ${pr.url}`);
+    let branch = this.run.branch;
+    if (dryRun) {
+      branch = await this.availableBranch(wantedBranch);
+    } else {
+      // V3, T6: a run resumed after a crash finds its own branch, commit and PR instead
+      // of making new ones. A branch counts as its own only if the head commit says so.
+      let headSha = this.run.headSha;
+      if (!headSha && branch) {
+        const head = await scm.branchHead(this.settings.repo, branch);
+        if (head?.message.includes(`Lockkeeper-Run: ${this.run.id}`)) {
+          headSha = head.sha;
+          this.update({ headSha });
+        } else if (head) {
+          branch = null;
+        }
+      }
+      if (!headSha) {
+        branch ??= await this.availableBranch(wantedBranch);
+        this.update({ branch });
+        // V3: commits and the PR are created here, under the App identity, never in the sandbox.
+        const message = `${title}\n\n${input.summary}\n\nTicket: ${ticket.url}\nLockkeeper-Run: ${this.run.id}\nAgent: ${this.deps.agent.displayName}\n`;
+        const commit = await scm.commit({
+          repo: this.settings.repo,
+          branch,
+          parentSha: input.base.sha,
+          message,
+          changes: collected.changes,
+          createBranch: true,
+        });
+        this.update({ headSha: commit.sha });
+        this.audit('commit', {
+          sha: commit.sha,
+          url: commit.url,
+          verified: commit.verified,
+          branch,
+          paths: collected.files.map((file) => file.path),
+        });
+        this.log.step(`Committed ${commit.sha.slice(0, 12)} to ${branch}`);
+      }
+      const head = branch as string;
+      if (this.run.prUrl && this.run.prNumber !== null) {
+        pr = { url: this.run.prUrl, number: this.run.prNumber, draft, state: 'open' };
+      } else {
+        const existing = await scm.findPullRequest(this.settings.repo, head);
+        pr =
+          existing ??
+          (await scm.openPullRequest({
+            repo: this.settings.repo,
+            head,
+            base: this.settings.baseBranch,
+            title,
+            body,
+            draft,
+          }));
+        this.update({ prNumber: pr.number, prUrl: pr.url });
+        this.audit('pull_request', pr);
+        this.log.step(`Opened ${pr.draft || draft ? 'draft ' : ''}pull request ${pr.url}`);
+      }
     }
+    const branchShown = branch as string;
 
     // J1, J2. A dry run makes the same calls, and the recording tracker keeps them.
-    this.setState('report');
+    if (this.run.state !== 'report') this.setState('report');
     const outcome = {
       pr: { url: pr.url, number: pr.number, draft },
-      branch,
+      branch: branchShown,
       criteria: input.criteria,
       checks: input.checks,
       draftReasons: input.draftReasons,
@@ -587,7 +953,13 @@ class TicketRun {
     };
     if (this.statusCommentId)
       await this.tracker.updateComment(key, this.statusCommentId, resultDoc(ctx, outcome));
-    await this.tracker.postComment(key, finalNoticeDoc(ctx, { kind: 'pr', url: pr.url, draft }));
+    if (!this.deps.store.latestEvent(this.run.id, 'final_notice')) {
+      const commentId = await this.tracker.postComment(
+        key,
+        finalNoticeDoc(ctx, { kind: 'pr', url: pr.url, draft }),
+      );
+      this.audit('final_notice', { commentId });
+    }
     await this.tracker.linkPullRequest(key, { url: pr.url, title });
     await this.tracker.updateLabels(key, {
       add: [config.jira.labels.in_review],
@@ -612,7 +984,7 @@ class TicketRun {
         outcome: 'dry_run',
         run: this.run,
         preview: {
-          branch,
+          branch: branchShown,
           title,
           body,
           comments: recorder.comments().map((comment) => docToPlainText(comment.body)),
@@ -639,80 +1011,98 @@ class TicketRun {
 
   // -------------------------------------------------------------------------
 
+  /** Start the round's agent, or reattach to it if an earlier process started it. */
   private async runAgent(
     round: number,
     input: { system: string; prompt: string; sessionId: string },
   ): Promise<string> {
     const { config, agent, modelKey } = this.deps;
     const sandbox = this.sandbox as SandboxHandle;
-    const layout = this.layoutHome.layout as Layout;
+    const layout = this.layout as Layout;
     const files = agentFiles(layout, round);
-    await sandbox.exec(`mkdir -p '${files.dir}'`, { timeoutMs: 30_000 });
-    await sandbox.writeFile(files.system, input.system);
-    await sandbox.writeFile(files.prompt, input.prompt);
-    // Each round gets what is left of the run's caps.
-    const budget = config.limits.cost_usd - (this.costUsd ?? 0);
-    const turnsLeft = config.limits.turns - (this.turns ?? 0);
-    if (budget < 0.01)
-      throw new CapExceededError(
-        'cost',
-        `The run reached its cost limit of $${config.limits.cost_usd}.`,
-      );
-    if (turnsLeft < 1)
-      throw new CapExceededError(
-        'turns',
-        `The agent reached its limit of ${config.limits.turns} turns.`,
-      );
-    const invocation = {
-      workdir: layout.repo,
-      promptFile: files.prompt,
-      systemPromptFile: files.system,
-      sessionId: input.sessionId,
-      resume: round > 0,
-      maxTurns: turnsLeft,
-      maxBudgetUsd: budget,
-      ...(config.agent.model ? { model: config.agent.model } : {}),
-    };
-    const command = agent.command(invocation);
-    const env = {
-      ...agent.environment(this.keyPlacement()),
-      [agent.credential.env]: modelKey.mode === 'env' ? modelKey.value : PLACEHOLDER_KEY,
-    };
-    await this.extendSandbox(this.sandboxTimeout());
-    await startAgent(sandbox, layout, files, command, env);
-    this.audit('agent_start', { round, command, budgetUsd: budget });
+    const started = await agentStarted(sandbox, files);
+    const skipBytes = started ? (this.run.agentOffset ?? 0) : 0;
+    if (started) {
+      this.log.step(`Reattaching to ${agent.displayName}`);
+      this.audit('agent_reattach', { round, offset: skipBytes });
+    } else {
+      // Each round gets what is left of the run's caps.
+      const budget = config.limits.cost_usd - (this.costUsd ?? 0);
+      const turnsLeft = config.limits.turns - (this.turns ?? 0);
+      if (budget < 0.01)
+        throw new CapExceededError(
+          'cost',
+          `The run reached its cost limit of $${config.limits.cost_usd}.`,
+        );
+      if (turnsLeft < 1)
+        throw new CapExceededError(
+          'turns',
+          `The agent reached its limit of ${config.limits.turns} turns.`,
+        );
+      await sandbox.exec(`mkdir -p '${files.dir}'`, { timeoutMs: 30_000 });
+      await sandbox.writeFile(files.system, input.system);
+      await sandbox.writeFile(files.prompt, input.prompt);
+      const invocation = {
+        workdir: layout.repo,
+        promptFile: files.prompt,
+        systemPromptFile: files.system,
+        sessionId: input.sessionId,
+        resume: round > 0,
+        maxTurns: turnsLeft,
+        maxBudgetUsd: budget,
+        ...(config.agent.model ? { model: config.agent.model } : {}),
+      };
+      const command = agent.command(invocation);
+      const env = {
+        ...agent.environment(this.keyPlacement()),
+        [agent.credential.env]: modelKey.mode === 'env' ? modelKey.value : PLACEHOLDER_KEY,
+      };
+      await this.extendSandbox(this.sandboxTimeout());
+      await startAgent(sandbox, layout, files, command, env);
+      this.update({ agentOffset: 0 });
+      this.audit('agent_start', { round, command, budgetUsd: budget });
+    }
 
+    let saved = skipBytes;
     const watch = await watchAgent(sandbox, files, {
       adapter: agent,
-      onEvent: (event) => this.onAgentEvent(event),
+      onEvent: (event) => this.onAgentEvent(event, round),
       deadline: this.deadline,
       pollMs: this.deps.pollMs ?? 3_000,
       keepAliveEveryMs: 60_000,
       sandboxTimeoutMs: this.sandboxTimeout(),
+      skipBytes,
+      onProgress: (offset) => {
+        if (offset <= saved) return;
+        saved = offset;
+        this.update({ agentOffset: offset });
+      },
       now: this.now,
       ...(this.deps.sleep ? { sleep: this.deps.sleep } : {}),
-      shouldStop: () => this.request.signal?.aborted ?? false,
+      shouldStop: () => this.stopRequest(),
     });
+    if (watch.stopped === 'detached') throw new RunDetachedError();
+    const result = watch.result;
+    // Cost is the session total so far; turns are this round's only (see AgentEvent).
+    if (result?.costUsd !== undefined) this.costUsd = result.costUsd;
+    if (result?.turns !== undefined) this.turns = (this.turns ?? 0) + result.turns;
     this.audit('agent_exit', {
       round,
       stopped: watch.stopped,
       exitCode: watch.exitCode,
-      outcome: watch.result?.outcome,
+      outcome: result?.outcome,
       stderr: tail(watch.stderr, 30),
+      ...(result?.text ? { text: result.text.slice(0, 50_000) } : {}),
     });
-    // Cost is the session total so far; turns are this round's only (see AgentEvent).
-    if (watch.result?.costUsd !== undefined) this.costUsd = watch.result.costUsd;
-    if (watch.result?.turns !== undefined) this.turns = (this.turns ?? 0) + watch.result.turns;
 
     if (watch.stopped === 'cancelled')
-      throw new RunCancelledError('The run was stopped before the agent finished.');
+      throw new RunCancelledError(cancelReason(this.request.signal));
     if (watch.stopped === 'deadline') {
       throw new CapExceededError(
         'minutes',
         `The run reached its time limit of ${config.limits.minutes} minutes.`,
       );
     }
-    const result = watch.result;
     if (result?.cap === 'cost')
       throw new CapExceededError(
         'cost',
@@ -738,10 +1128,19 @@ class TicketRun {
         detail,
       );
     }
+    // Leave the implement state in the same write as the round's cost and turns, so a
+    // restart never counts them twice.
+    this.update({
+      state: 'verify',
+      costUsd: this.costUsd ?? null,
+      turns: this.turns ?? null,
+      agentOffset: null,
+    });
+    this.audit('state', { state: 'verify', round });
     return result.text;
   }
 
-  private onAgentEvent(event: AgentEvent): void {
+  private onAgentEvent(event: AgentEvent, round: number): void {
     switch (event.type) {
       case 'session':
         this.log.info(`Agent session ${event.sessionId}${event.model ? ` (${event.model})` : ''}`);
@@ -768,7 +1167,7 @@ class TicketRun {
       event.type === 'message' && event.text.length > 2_000
         ? { ...event, text: `${event.text.slice(0, 2_000)}…` }
         : event;
-    this.audit('agent', stored);
+    this.audit('agent', { round, ...stored });
   }
 
   private async hasChanges(
@@ -819,6 +1218,7 @@ class TicketRun {
       state: 'done',
       finishedAt: new Date(this.now()).toISOString(),
       costUsd: this.costUsd ?? null,
+      turns: this.turns ?? null,
     });
     return { outcome: 'no_changes', run: this.run };
   }
@@ -840,9 +1240,29 @@ class TicketRun {
     return { outcome: 'refused', run: this.run, reason };
   }
 
+  /** Leave the run for a later process. The sandbox is paused, so it costs nothing meanwhile. */
+  private async detached(): Promise<RunResult> {
+    this.audit('detached', { state: this.run.state, leaseLost: this.leaseLost });
+    if (!this.leaseLost && this.sandbox && this.deps.sandboxes.capabilities.pause) {
+      try {
+        await this.sandbox.pause();
+      } catch (error) {
+        this.log.debug(`Could not pause sandbox ${this.sandbox.id}: ${(error as Error).message}`);
+      }
+    }
+    this.log.warn(
+      `Run ${this.run.id} stopped in the ${this.run.state} step. It continues when Lockkeeper starts again.`,
+    );
+    return { outcome: 'detached', run: this.run };
+  }
+
   private async fail(error: unknown): Promise<RunResult> {
-    const err = error instanceof Error ? error : new Error(String(error));
-    const state: RunState = err instanceof RunCancelledError ? 'cancelled' : 'failed';
+    let err = error instanceof Error ? error : new Error(String(error));
+    // Once stopped, whatever broke next is part of stopping, not a failure.
+    const cancelled = err instanceof RunCancelledError || this.request.signal?.aborted === true;
+    if (cancelled && !(err instanceof RunCancelledError))
+      err = new RunCancelledError(cancelReason(this.request.signal));
+    const state: RunState = cancelled ? 'cancelled' : 'failed';
     const reason = describeFailure(err);
     const logTail = err instanceof StepFailedError ? err.logTail : undefined;
     this.audit('error', {
@@ -856,6 +1276,7 @@ class TicketRun {
     if (this.ticket && this.statusCommentId) {
       const ctx = this.context();
       const key = this.run.ticketKey;
+      const labels = this.deps.config.jira.labels;
       try {
         await this.tracker.updateComment(
           key,
@@ -867,11 +1288,16 @@ class TicketRun {
             durationMs: this.now() - this.startedAt,
           }),
         );
-        await this.tracker.postComment(key, finalNoticeDoc(ctx, { kind: 'failed', reason }));
-        await this.tracker.updateLabels(key, {
-          add: [this.deps.config.jira.labels.failed],
-          remove: [this.deps.config.jira.labels.working],
-        });
+        // Whoever stopped the run knows. Only a failure needs a notification.
+        if (!cancelled) {
+          await this.tracker.postComment(key, finalNoticeDoc(ctx, { kind: 'failed', reason }));
+        }
+        await this.tracker.updateLabels(
+          key,
+          cancelled
+            ? { remove: [labels.working, labels.trigger] }
+            : { add: [labels.failed], remove: [labels.working] },
+        );
       } catch (reportError) {
         this.log.warn(`Could not report the failure on ${key}: ${(reportError as Error).message}`);
       }
@@ -890,6 +1316,7 @@ class TicketRun {
       error: err.message,
       finishedAt: new Date(this.now()).toISOString(),
       costUsd: this.costUsd ?? null,
+      turns: this.turns ?? null,
     });
     return { outcome: 'failed', run: this.run, error: err };
   }
@@ -922,19 +1349,53 @@ class TicketRun {
     }
   }
 
+  private stopRequest(): StopRequest {
+    if (this.request.signal?.aborted) return 'cancel';
+    if (this.request.detach?.aborted || this.leaseLost) return 'detach';
+    return false;
+  }
+
   private checkCancelled(): void {
     if (this.request.signal?.aborted)
-      throw new RunCancelledError('The run was stopped from the command line.');
+      throw new RunCancelledError(cancelReason(this.request.signal));
+    if (this.request.detach?.aborted || this.leaseLost) throw new RunDetachedError();
+  }
+
+  /**
+   * Stop sandbox work at once when the run is cancelled, so a stop takes effect within
+   * seconds even in the middle of a long setup command (F3).
+   */
+  private async interrupt(): Promise<void> {
+    const sandbox = this.sandbox;
+    if (!sandbox) return;
+    try {
+      await sandbox.destroy();
+      if (this.sandbox === sandbox) this.sandbox = undefined;
+    } catch (error) {
+      this.log.debug(`Could not delete the sandbox: ${(error as Error).message}`);
+    }
+  }
+
+  private renewLease(): void {
+    try {
+      const held = this.deps.store.renewLease(this.run.id, PROCESS_OWNER, leaseEnd(this.now()));
+      if (!held && !this.leaseLost) {
+        this.leaseLost = true;
+        this.log.warn(`Another Lockkeeper process took over run ${this.run.id}. Stopping here.`);
+      }
+    } catch (error) {
+      this.log.debug(`Could not renew the lease: ${(error as Error).message}`);
+    }
+  }
+
+  private keyPlacement(): KeyPlacement {
+    return { keyInEnvironment: this.deps.modelKey.mode === 'env' };
   }
 
   /**
    * Push the sandbox's expiry out before a long step. Best effort: the timeout set at
    * creation already covers the run, and plans cap continuous runtime differently.
    */
-  private keyPlacement(): KeyPlacement {
-    return { keyInEnvironment: this.deps.modelKey.mode === 'env' };
-  }
-
   private async extendSandbox(timeoutMs: number): Promise<void> {
     try {
       await this.sandbox?.keepAlive(timeoutMs);
@@ -953,9 +1414,9 @@ class TicketRun {
     return Math.min(MAX_SANDBOX_MS, Math.max(5 * 60_000, this.deadline - this.now() + 10 * 60_000));
   }
 
-  private setState(state: RunState): void {
-    this.update({ state });
-    this.audit('state', { state });
+  private setState(state: RunState, extra: { round?: number } = {}): void {
+    this.update({ state, ...extra });
+    this.audit('state', { state, ...extra });
   }
 
   private update(patch: Parameters<Store['updateRun']>[1]): void {

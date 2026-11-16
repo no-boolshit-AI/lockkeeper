@@ -20,8 +20,9 @@ export class AlreadyActiveError extends LockkeeperError {
   constructor(
     readonly ticketKey: string,
     readonly runId: string,
+    hint?: string,
   ) {
-    super(`${ticketKey} already has an active run (${runId}).`);
+    super(`${ticketKey} already has an active run (${runId}).`, hint);
   }
 }
 

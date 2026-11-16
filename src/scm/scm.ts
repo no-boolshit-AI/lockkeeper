@@ -68,11 +68,18 @@ export interface PullRequest {
   state: string;
 }
 
+export interface BranchHead {
+  sha: string;
+  message: string;
+}
+
 export interface SourceControl {
   readonly kind: string;
   resolveBase(repo: string, branch: string): Promise<BaseRef>;
   cloneAccess(repo: string): Promise<CloneAccess>;
   branchExists(repo: string, branch: string): Promise<boolean>;
+  /** The newest commit on a branch, or undefined if the branch does not exist. */
+  branchHead(repo: string, branch: string): Promise<BranchHead | undefined>;
   commit(input: CommitInput): Promise<CommitResult>;
   openPullRequest(input: PullRequestInput): Promise<PullRequest>;
   findPullRequest(repo: string, head: string): Promise<PullRequest | undefined>;

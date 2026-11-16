@@ -5,6 +5,7 @@ import { parseConfig } from '../../src/config/load.js';
 import type { Config } from '../../src/config/schema.js';
 import type {
   BaseRef,
+  BranchHead,
   CloneAccess,
   CommitInput,
   CommitResult,
@@ -87,11 +88,21 @@ export class FakeScm implements SourceControl {
   readonly commits: CommitInput[] = [];
   readonly pullRequests: PullRequestInput[] = [];
   readonly existingBranches = new Set<string>();
+  /** Head commits by branch, for branches that exist. */
+  readonly heads = new Map<string, BranchHead>();
+  /** Called before and after each write, so a test can simulate a crash at that point. */
+  beforeWrite: ((action: 'commit' | 'pull_request') => void) | undefined;
+  afterWrite: ((action: 'commit' | 'pull_request') => void) | undefined;
 
   constructor(
     private readonly bare: string,
     private readonly baseSha: string,
   ) {}
+
+  async branchHead(_repo: string, branch: string): Promise<BranchHead | undefined> {
+    if (!this.existingBranches.has(branch)) return undefined;
+    return this.heads.get(branch) ?? { sha: 'f'.repeat(40), message: 'Someone else' };
+  }
 
   async resolveBase(_repo: string, branch: string): Promise<BaseRef> {
     return { branch, sha: this.baseSha };
@@ -110,13 +121,19 @@ export class FakeScm implements SourceControl {
   }
 
   async commit(input: CommitInput): Promise<CommitResult> {
+    this.beforeWrite?.('commit');
     this.commits.push(input);
     this.existingBranches.add(input.branch);
-    return { sha: 'c'.repeat(40), url: 'https://github.com/acme/demo/commit/ccc', verified: true };
+    const sha = 'c'.repeat(40);
+    this.heads.set(input.branch, { sha, message: input.message });
+    this.afterWrite?.('commit');
+    return { sha, url: 'https://github.com/acme/demo/commit/ccc', verified: true };
   }
 
   async openPullRequest(input: PullRequestInput): Promise<PullRequest> {
+    this.beforeWrite?.('pull_request');
     this.pullRequests.push(input);
+    this.afterWrite?.('pull_request');
     return {
       number: 7,
       url: 'https://github.com/acme/demo/pull/7',
@@ -125,8 +142,11 @@ export class FakeScm implements SourceControl {
     };
   }
 
-  async findPullRequest(): Promise<PullRequest | undefined> {
-    return undefined;
+  async findPullRequest(_repo: string, head: string): Promise<PullRequest | undefined> {
+    const pr = this.pullRequests.find((entry) => entry.head === head);
+    return pr
+      ? { number: 7, url: 'https://github.com/acme/demo/pull/7', draft: pr.draft, state: 'open' }
+      : undefined;
   }
 }
 
