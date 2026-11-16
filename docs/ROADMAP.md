@@ -67,7 +67,7 @@ Known gaps to close in M2:
 - Cleanup of lingering agent processes before verification is best effort, by session.
 - Allowing any domain on E2B also opens its DNS resolver.
 - The sandbox user has passwordless sudo.
-- GitHub stays reachable while the agent works. E2B's `updateNetwork` could close it after the clone.
+- GitHub stays reachable while the agent works unless `sandbox.close_github_after_setup` is set. Package registries stay open, so a hijacked agent could still publish to one with credentials planted in a ticket; the PR flags any outside host its commands named.
 - Paused sandboxes stay until the cleanup planned for M3.
 
 ## M2 Private alpha (weeks 3-6)
@@ -87,9 +87,15 @@ Goal: a team labels tickets and gets PRs or questions back without anyone runnin
 | Final result comment, optional status transition | J1, J2 | Done in M1; the final comment now mentions whoever added the label |
 | `/agent stop`, removing the label, and `/agent retry` with a hint | F3 | Done. A retry adds to the open PR's branch, fast-forward only |
 | `init`: GitHub App through the manifest flow, Jira and E2B checks, config written. `doctor`: credentials, sandbox boot, clone, setup, tests, network policy, secret injection, branch rules | O1 | Done. `doctor` passed against the live demo setup on 16 Nov 2026 |
-| Full audit trail: who triggered the run, blocked requests, cost | O2 | Trigger and cost done; blocked requests not started |
+| Full audit trail: who triggered the run, blocked requests, cost | O2 | Done. E2B keeps no log of blocked requests, so hosts outside the allow-list named in the agent's commands are recorded and flagged in the PR |
 
 Exit gate: 20 real tickets across 3 design-partner teams, at least half merged.
+
+Build status on 16 November 2026: every M2 workstream is built and tested (144 tests, plus a live `doctor` run). Not yet done: a live run of `lockkeeper start` on real tickets, and the design partners. Notes for later:
+
+- The readiness check and the implementation use separate agent sessions, so the implementation reads the code again. Continuing the check's session would save time and tokens.
+- The time limit counts from a run's first start, including time Lockkeeper was stopped. Waiting for answers resets it.
+- A run waiting for answers holds no sandbox. `/agent go` starts a fresh one.
 
 ## M3 Public beta (weeks 7-10)
 

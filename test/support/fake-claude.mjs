@@ -69,6 +69,20 @@ for (const [file, content] of Object.entries(step.writes ?? {})) {
     message: { content: [{ type: 'tool_result', tool_use_id: `tool-${file}`, is_error: false }] },
   });
 }
+for (const [index, command] of (step.commands ?? []).entries()) {
+  // Reported as Bash tool calls, not run: enough for what Lockkeeper reads from them.
+  const id = `bash-${index}`;
+  emit({
+    type: 'assistant',
+    session_id: sessionId,
+    message: { content: [{ type: 'tool_use', id, name: 'Bash', input: { command } }] },
+  });
+  emit({
+    type: 'user',
+    session_id: sessionId,
+    message: { content: [{ type: 'tool_result', tool_use_id: id, is_error: true }] },
+  });
+}
 for (const file of step.deletes ?? []) rmSync(file, { force: true });
 if (step.sleepMs) await new Promise((resolve) => setTimeout(resolve, step.sleepMs));
 

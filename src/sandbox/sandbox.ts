@@ -68,6 +68,8 @@ export interface SandboxHandle {
   keepAlive(timeoutMs: number): Promise<void>;
   pause(): Promise<void>;
   destroy(): Promise<void>;
+  /** Replace the egress rules of a running sandbox, where the provider can. */
+  setEgress?(allowDomains: string[], secrets: SecretBinding[]): Promise<void>;
 }
 
 export interface SandboxProvider {

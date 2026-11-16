@@ -3,7 +3,7 @@ import { CapExceededError, LockkeeperError } from '../../src/core/errors.js';
 import { Authorizer } from '../../src/engine/authorize.js';
 import { parseCommand } from '../../src/engine/commands.js';
 import { detectCommands } from '../../src/engine/detect.js';
-import { allowList } from '../../src/engine/domains.js';
+import { allowList, hostsOutside } from '../../src/engine/domains.js';
 import {
   agentsMdCommands,
   devcontainerSetup,
@@ -418,5 +418,21 @@ describe('test files and test commands (E5)', () => {
     expect(testCommands(['npm run lint', 'npm test'])).toEqual(['npm test']);
     expect(testCommands(['make check'])).toEqual(['make check']);
     expect(testCommands([])).toEqual([]);
+  });
+});
+
+describe('hosts outside the allow-list (O2)', () => {
+  it('finds hosts in URLs and git remotes, minus allowed and loopback ones', () => {
+    expect(
+      hostsOutside(
+        [
+          'curl https://registry.npmjs.org/x && wget http://Evil.Example.com/a',
+          'git push git@gitlab.example.org:me/repo.git',
+          'curl http://127.0.0.1:3000 http://localhost:8080 https://203.0.113.9/drop',
+          'npm view left-pad',
+        ],
+        ['registry.npmjs.org', 'github.com'],
+      ),
+    ).toEqual(['203.0.113.9', 'evil.example.com', 'gitlab.example.org']);
   });
 });

@@ -5,6 +5,7 @@ import type {
   SandboxHandle,
   SandboxProvider,
   SandboxSpec,
+  SecretBinding,
 } from '../sandbox.js';
 
 /** E2B's pre-built template with Claude Code installed. */
@@ -31,30 +32,13 @@ export class E2BProvider implements SandboxProvider {
   constructor(private readonly options: E2BProviderOptions) {}
 
   async create(spec: SandboxSpec): Promise<SandboxHandle> {
-    const rules = Object.fromEntries(
-      (spec.secrets ?? []).map((secret) => [
-        secret.host,
-        [
-          {
-            transform: {
-              headers: { [secret.header]: `${secret.prefix ?? ''}${Secret.fill(secret.name)}` },
-            },
-          },
-        ],
-      ]),
-    );
-    const allowOut = [...new Set([...spec.allowDomains, ...Object.keys(rules)])];
     const sandbox = await Sandbox.create(
       spec.template ?? this.options.template ?? DEFAULT_E2B_TEMPLATE,
       {
         apiKey: this.options.apiKey,
         timeoutMs: spec.timeoutMs,
         metadata: spec.metadata,
-        network: {
-          allowOut,
-          denyOut: ({ allTraffic }) => [allTraffic],
-          ...(Object.keys(rules).length > 0 ? { rules } : {}),
-        },
+        network: networkFor(spec.allowDomains, spec.secrets ?? []),
         // Pause instead of dying if the control plane stops extending the timeout.
         lifecycle: { onTimeout: 'pause', autoResume: false },
         ...(spec.idempotencyKey ? { idempotencyKey: spec.idempotencyKey } : {}),
@@ -81,6 +65,30 @@ export class E2BProvider implements SandboxProvider {
   async hasSecret(name: string): Promise<boolean> {
     return Secret.exists(name, { apiKey: this.options.apiKey });
   }
+}
+
+/**
+ * Egress denied except to the allow-list, with each secret added to requests for its
+ * host by E2B's proxy (E2, E3). Used at creation and for later updates.
+ */
+function networkFor(allowDomains: readonly string[], secrets: readonly SecretBinding[]) {
+  const rules = Object.fromEntries(
+    secrets.map((secret) => [
+      secret.host,
+      [
+        {
+          transform: {
+            headers: { [secret.header]: `${secret.prefix ?? ''}${Secret.fill(secret.name)}` },
+          },
+        },
+      ],
+    ]),
+  );
+  return {
+    allowOut: [...new Set([...allowDomains, ...Object.keys(rules)])],
+    denyOut: ({ allTraffic }: { allTraffic: string }) => [allTraffic],
+    ...(Object.keys(rules).length > 0 ? { rules } : {}),
+  };
 }
 
 class E2BSandbox implements SandboxHandle {
@@ -148,5 +156,9 @@ class E2BSandbox implements SandboxHandle {
 
   async destroy(): Promise<void> {
     await this.sandbox.kill();
+  }
+
+  async setEgress(allowDomains: string[], secrets: SecretBinding[]): Promise<void> {
+    await this.sandbox.updateNetwork(networkFor(allowDomains, secrets));
   }
 }

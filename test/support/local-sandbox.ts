@@ -54,6 +54,8 @@ export class LocalSandbox implements SandboxHandle {
   paused = false;
   destroyed = false;
   readonly commands: { command: string; env?: Record<string, string> }[] = [];
+  /** Allow-lists set after creation, in order. */
+  readonly egress: string[][] = [];
 
   constructor(
     readonly homeDir: string,
@@ -120,6 +122,10 @@ export class LocalSandbox implements SandboxHandle {
   }
 
   async keepAlive(): Promise<void> {}
+
+  async setEgress(allowDomains: string[]): Promise<void> {
+    this.egress.push(allowDomains);
+  }
 
   async pause(): Promise<void> {
     this.paused = true;

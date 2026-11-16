@@ -37,6 +37,33 @@ export const DEFAULT_REGISTRY_DOMAINS: readonly string[] = [
   'repo.packagist.org',
 ];
 
+/**
+ * Hosts named in commands that the allow-list does not cover. The sandbox blocks them,
+ * but a reviewer should know the agent tried: it is a common sign of instructions
+ * aimed at the agent hidden in a ticket. Loopback addresses are left out.
+ */
+export function hostsOutside(
+  commands: readonly string[],
+  allowDomains: readonly string[],
+): string[] {
+  const allowed = new Set(allowDomains.map((domain) => domain.toLowerCase()));
+  const found = new Set<string>();
+  const add = (raw: string | undefined) => {
+    const host = (raw ?? '').toLowerCase().replace(/\.$/, '');
+    if (!host || allowed.has(host) || host === 'localhost' || host === '0.0.0.0') return;
+    if (/^127\./.test(host)) return;
+    found.add(host);
+  };
+  for (const command of commands) {
+    for (const match of command.matchAll(
+      /\b(?:https?|wss?|ftp):\/\/([a-z0-9-]+(?:\.[a-z0-9-]+)+)/gi,
+    ))
+      add(match[1]);
+    for (const match of command.matchAll(/\bgit@([a-z0-9-]+(?:\.[a-z0-9-]+)+):/gi)) add(match[1]);
+  }
+  return [...found].sort();
+}
+
 export function allowList(input: {
   agentDomains: readonly string[];
   registries?: readonly string[];

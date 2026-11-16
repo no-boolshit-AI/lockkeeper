@@ -27,7 +27,7 @@ import { isExecuting, type RunRecord, type RunState, type Store } from '../store
 import { RecordingTracker } from '../tracker/recording-tracker.js';
 import type { TicketSnapshot, Tracker } from '../tracker/tracker.js';
 import { detectCommands } from './detect.js';
-import { allowList } from './domains.js';
+import { allowList, GITHUB_DOMAINS, hostsOutside } from './domains.js';
 import { type ResolvedCommands, resolveCommands } from './environment.js';
 import {
   changedPaths,
@@ -204,6 +204,8 @@ interface Work {
   draftReasons: string[];
   /** Bug fixes: whether the new tests fail without the fix (E5). */
   proof?: FailingTestProof;
+  /** Hosts outside the allow-list that the agent's commands named (O2). */
+  outsideHosts?: string[];
 }
 
 function normalizeKey(input: string): string {
@@ -663,6 +665,13 @@ class TicketRun {
         );
       }
     }
+    if (config.sandbox.close_github_after_setup && sandbox.setEgress) {
+      // From here on, the agent can reach only the model API and package registries.
+      const narrowed = allowDomains.filter((domain) => !GITHUB_DOMAINS.includes(domain));
+      await sandbox.setEgress(narrowed, secrets);
+      this.audit('egress', { allowDomains: narrowed, reason: 'GitHub closed after setup' });
+      this.log.info('GitHub is closed to the sandbox for the rest of the run.');
+    }
     this.checkCancelled();
   }
 
@@ -1044,6 +1053,7 @@ class TicketRun {
     if (workflow === 'bugfix' && checks.every((check) => check.passed)) {
       proof = await this.proveFailingTest(ctx, report);
     }
+    const outsideHosts = this.outsideHosts();
     this.checkCancelled();
     const work: Work = {
       finalText,
@@ -1051,6 +1061,7 @@ class TicketRun {
       checks,
       draftReasons,
       ...(proof ? { proof } : {}),
+      ...(outsideHosts.length > 0 ? { outsideHosts } : {}),
     };
     this.audit('implemented', work);
     this.setState('collect');
@@ -1110,6 +1121,25 @@ class TicketRun {
     return proof;
   }
 
+  /** O2: hosts outside the allow-list that the agent's commands named, from the audit log. */
+  private outsideHosts(): string[] {
+    const { store } = this.deps;
+    const egress =
+      store.latestEvent<{ allowDomains?: string[] }>(this.run.id, 'egress') ??
+      store.latestEvent<{ allowDomains?: string[] }>(this.run.id, 'sandbox');
+    const commands = store
+      .events(this.run.id, { kind: 'agent' })
+      .map((event) => event.data as { type?: string; summary?: string })
+      .filter((data) => data.type === 'tool_call' && typeof data.summary === 'string')
+      .map((data) => data.summary as string);
+    const hosts = hostsOutside(commands, egress?.allowDomains ?? []);
+    if (hosts.length > 0) {
+      this.audit('outside_hosts', { hosts });
+      this.log.warn(`The agent named hosts outside the allow-list: ${hosts.join(', ')}`);
+    }
+    return hosts;
+  }
+
   /** Package and check the result (V2), then publish it. */
   private async collectAndPublish(work: Work): Promise<RunResult> {
     const { config } = this.deps;
@@ -1154,6 +1184,11 @@ class TicketRun {
       .slice(0, 10)
       .map((risk) => cleanAgentText(risk, 300))
       .filter(Boolean);
+    if (work.outsideHosts && work.outsideHosts.length > 0) {
+      risks.unshift(
+        `The agent's commands named hosts outside the sandbox's allow-list, which the sandbox blocks: ${work.outsideHosts.slice(0, 10).join(', ')}. If the ticket did not call for this, check it for instructions aimed at the agent.`,
+      );
+    }
     const criteria = matchCriteria(ticket.acceptanceCriteria, report).map((criterion) => ({
       criterion: cleanAgentText(criterion.criterion, 300),
       met: criterion.met,

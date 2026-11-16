@@ -57,6 +57,8 @@ sandbox:
   # template: claude
   # Hosts the sandbox may reach on top of the model API, GitHub and package registries.
   allow_domains: []
+  # Close GitHub to the agent once setup is done. Setup can still fetch git dependencies.
+  close_github_after_setup: false
 
 limits:
   cost_usd: 10

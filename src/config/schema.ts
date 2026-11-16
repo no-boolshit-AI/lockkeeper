@@ -132,6 +132,11 @@ export const configSchema = z.object({
       allow_domains: z.array(z.string().min(1)).default([]),
       /** Replace the default package-registry allow-list entirely. */
       registries: z.array(z.string().min(1)).optional(),
+      /**
+       * Close GitHub to the sandbox once setup is done, so the agent can reach only the
+       * model API and package registries. Setup can still fetch git dependencies.
+       */
+      close_github_after_setup: z.boolean().default(false),
     })
     .prefault({}),
   limits: z
