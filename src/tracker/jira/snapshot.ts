@@ -62,15 +62,25 @@ export function buildSnapshot(input: SnapshotInput): TicketSnapshot {
   }
 
   const reporter = toPerson(fields.reporter);
+  const self = input.self;
   const comments = input.comments
-    .filter((comment) => !input.self || comment.author?.accountId !== input.self.accountId)
     .map((comment) => ({
       id: comment.id,
       author: toPerson(comment.author) ?? { accountId: 'unknown', displayName: 'Unknown' },
       created: comment.created,
       body: adfToMarkdown(comment.body, stats),
     }))
-    .filter((comment) => comment.body !== '');
+    // Leave out Lockkeeper's own status comments, but not other comments by the same
+    // account: a person trying Lockkeeper with their own token still writes tickets.
+    .filter(
+      (comment) =>
+        comment.body !== '' &&
+        !(
+          self &&
+          comment.author.accountId === self.accountId &&
+          /\bLockkeeper\b/.test(comment.body)
+        ),
+    );
 
   const externalAuthors = new Map<string, Person>();
   for (const person of [reporter, ...comments.map((comment) => comment.author)]) {

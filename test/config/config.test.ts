@@ -159,4 +159,31 @@ describe('loading from disk and the environment', () => {
     expect(() => requireSecrets(result, ['jiraEmail'])).toThrow(/LOCKKEEPER_JIRA_EMAIL/);
     expect(requireSecrets(result, ['jiraToken'])).toMatchObject({ jiraToken: 't' });
   });
+
+  it('treats empty variables as unset and resolves key paths against the config folder', () => {
+    dir = mkdtempSync(join(tmpdir(), 'lockkeeper-secrets-'));
+    mkdirSync(join(dir, '.lockkeeper'));
+    writeFileSync(join(dir, '.lockkeeper', 'app.pem'), 'PEM');
+    const config = parseConfig(
+      `${PRD_EXAMPLE}\n`.replace(
+        '  site: acme.atlassian.net',
+        '  site: acme.atlassian.net\n  email: bot@acme.com',
+      ),
+    );
+    const result = readSecrets(
+      config,
+      { LOCKKEEPER_JIRA_EMAIL: '', LOCKKEEPER_GITHUB_PRIVATE_KEY_PATH: '.lockkeeper/app.pem' },
+      dir,
+    );
+    expect(result.secrets.jiraEmail).toBe('bot@acme.com');
+    expect(result.secrets.githubPrivateKey).toBe('PEM');
+    const missingFile = readSecrets(
+      config,
+      { LOCKKEEPER_GITHUB_PRIVATE_KEY_PATH: 'nope.pem' },
+      dir,
+    );
+    expect(missingFile.missing.find((entry) => entry.name === 'githubPrivateKey')?.how).toMatch(
+      /nope\.pem does not exist/,
+    );
+  });
 });

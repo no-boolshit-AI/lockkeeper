@@ -223,7 +223,13 @@ describe('ticket snapshots', () => {
           id: '2',
           author: { accountId: 'acc-bot', displayName: 'Lockkeeper' },
           created: '2026-11-16T09:01:00Z',
-          body: doc(para(txt('working'))),
+          body: doc(para(txt('Lockkeeper', [{ type: 'strong' }]), txt(' · SHOP-9 · working'))),
+        },
+        {
+          id: '3',
+          author: { accountId: 'acc-bot', displayName: 'Lockkeeper' },
+          created: '2026-11-16T09:02:00Z',
+          body: doc(para(txt('Also keep the old API working.'))),
         },
       ],
       site: 'acme.atlassian.net',
@@ -243,7 +249,11 @@ describe('ticket snapshots', () => {
       externalAuthors: [],
       capturedAt: '2026-11-16T10:00:00.000Z',
     });
-    expect(snapshot.comments.map((comment) => comment.body)).toEqual(['Use banker rounding?']);
+    // The status comment is left out; a normal comment by the same account stays.
+    expect(snapshot.comments.map((comment) => comment.body)).toEqual([
+      'Use banker rounding?',
+      'Also keep the old API working.',
+    ]);
   });
 
   it('prefers an acceptance criteria field and flags customer authors', () => {

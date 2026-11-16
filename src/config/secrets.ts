@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
+import { isAbsolute, resolve } from 'node:path';
 import { ConfigError } from '../core/errors.js';
 import type { Config } from './schema.js';
 
@@ -29,35 +30,49 @@ export interface SecretsResult {
   missing: { name: keyof Secrets; how: string }[];
 }
 
-export function readSecrets(config: Config, env: NodeJS.ProcessEnv = process.env): SecretsResult {
+/**
+ * @param baseDir where relative paths in the environment resolve: the config file's
+ *   folder, so `.lockkeeper/github-app.pem` works wherever the command runs.
+ */
+export function readSecrets(
+  config: Config,
+  env: NodeJS.ProcessEnv = process.env,
+  baseDir = process.cwd(),
+): SecretsResult {
   const secrets: Partial<Secrets> = {};
   const missing: SecretsResult['missing'] = [];
+  // An empty `NAME=` line in .env means "not set", so the config fallback still applies.
+  const fromEnv = (name: string) => env[name]?.trim() || undefined;
 
-  const jiraEmail = env[ENV.jiraEmail] ?? config.jira.email;
+  const jiraEmail = fromEnv(ENV.jiraEmail) ?? config.jira.email;
   if (jiraEmail) secrets.jiraEmail = jiraEmail;
   else missing.push({ name: 'jiraEmail', how: `set ${ENV.jiraEmail} or jira.email` });
 
-  const jiraToken = env[ENV.jiraToken];
+  const jiraToken = fromEnv(ENV.jiraToken);
   if (jiraToken) secrets.jiraToken = jiraToken;
   else missing.push({ name: 'jiraToken', how: `set ${ENV.jiraToken} to a Jira API token` });
 
-  const e2bApiKey = env[ENV.e2bApiKey];
+  const e2bApiKey = fromEnv(ENV.e2bApiKey);
   if (e2bApiKey) secrets.e2bApiKey = e2bApiKey;
   else missing.push({ name: 'e2bApiKey', how: `set ${ENV.e2bApiKey}` });
 
-  const appId = env[ENV.githubAppId] ?? config.github.app_id?.toString();
+  const appId = fromEnv(ENV.githubAppId) ?? config.github.app_id?.toString();
   if (appId) secrets.githubAppId = appId;
   else missing.push({ name: 'githubAppId', how: `set ${ENV.githubAppId} or github.app_id` });
 
-  const inlineKey = env[ENV.githubPrivateKey];
-  const keyPath = env[ENV.githubPrivateKeyPath] ?? config.github.private_key_path;
+  const inlineKey = fromEnv(ENV.githubPrivateKey);
+  const envKeyPath = fromEnv(ENV.githubPrivateKeyPath);
+  const keyPath = envKeyPath
+    ? isAbsolute(envKeyPath)
+      ? envKeyPath
+      : resolve(baseDir, envKeyPath)
+    : config.github.private_key_path;
   if (inlineKey) {
     secrets.githubPrivateKey = inlineKey.replace(/\\n/g, '\n');
-  } else if (keyPath) {
-    if (!existsSync(keyPath)) {
-      throw new ConfigError(`The GitHub App private key file does not exist: ${keyPath}`);
-    }
+  } else if (keyPath && existsSync(keyPath)) {
     secrets.githubPrivateKey = readFileSync(keyPath, 'utf8');
+  } else if (keyPath) {
+    missing.push({ name: 'githubPrivateKey', how: `the key file ${keyPath} does not exist` });
   } else {
     missing.push({
       name: 'githubPrivateKey',

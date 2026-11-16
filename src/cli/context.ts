@@ -19,7 +19,7 @@ export interface CliContext {
 export function loadContext(configPath?: string): CliContext {
   const loaded = loadConfig(configPath);
   const envFile = loadEnvFile(loaded.dir);
-  return { loaded, secrets: readSecrets(loaded.config), envFile };
+  return { loaded, secrets: readSecrets(loaded.config, process.env, loaded.dir), envFile };
 }
 
 export function openStore(context: CliContext): Store {
