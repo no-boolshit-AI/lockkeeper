@@ -372,6 +372,18 @@ export class Store {
     return rows.map(toRecord);
   }
 
+  /** The newest run of each ticket, if it is in one of `states` and changed since `since`. */
+  latestRuns(since: Date, states: readonly RunState[]): RunRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM runs r WHERE r.updated_at >= ? AND r.state IN (${sqlList(states)})
+           AND r.created_at = (SELECT MAX(x.created_at) FROM runs x WHERE x.ticket_key = r.ticket_key)
+         ORDER BY r.updated_at`,
+      )
+      .all(since.toISOString()) as Row[];
+    return rows.map(toRecord);
+  }
+
   /** Every run that still owns its ticket, oldest first. */
   activeRuns(): RunRecord[] {
     const rows = this.db

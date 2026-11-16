@@ -54,8 +54,11 @@ export async function cloneRepo(
   access: CloneAccess,
   base: BaseRef,
   timeoutMs: number,
+  /** Another branch to fetch, such as the base branch when continuing a PR branch. */
+  also?: BaseRef,
 ): Promise<void> {
   if (!isObjectId(base.sha)) throw new Error(`Invalid base commit: ${base.sha}`);
+  if (also && !isObjectId(also.sha)) throw new Error(`Invalid commit: ${also.sha}`);
   // The token travels in an environment variable and a one-off `git -c` header, so it
   // is never written to .git/config and never appears in the command line.
   const auth = access.authHeader ? '-c http.extraHeader="$LOCKKEEPER_GIT_AUTH" ' : '';
@@ -65,6 +68,12 @@ export async function cloneRepo(
     `rm -rf ${q(layout.repo)}`,
     `git ${auth}clone --quiet --no-tags --single-branch --branch ${q(base.branch)} ${q(access.url)} ${q(layout.repo)}`,
     `cd ${q(layout.repo)}`,
+    ...(also
+      ? [
+          `git ${auth}fetch --quiet --no-tags origin ${q(`+refs/heads/${also.branch}:refs/remotes/origin/${also.branch}`)}`,
+          `git cat-file -e ${also.sha}^{commit}`,
+        ]
+      : []),
     `git checkout --quiet --detach ${base.sha}`,
     `git config user.name 'Lockkeeper agent'`,
     `git config user.email 'agent@lockkeeper.invalid'`,
@@ -81,6 +90,30 @@ export async function cloneRepo(
       tail(result.stderr || result.stdout),
     );
   }
+}
+
+/** Where two commits' histories meet: the point a pull request branch forked from. */
+export async function mergeBase(
+  sandbox: SandboxHandle,
+  layout: Layout,
+  a: string,
+  b: string,
+): Promise<string> {
+  if (!isObjectId(a) || !isObjectId(b)) throw new Error('Invalid commit for merge-base.');
+  const result = await sandbox.exec(`git merge-base ${a} ${b}`, {
+    cwd: layout.repo,
+    timeoutMs: 60_000,
+  });
+  // Read back from the sandbox, so checked before use (rule 4).
+  const sha = result.stdout.trim();
+  if (result.exitCode !== 0 || !isObjectId(sha)) {
+    throw new StepFailedError(
+      'collect',
+      'git could not find where the branch forked.',
+      tail(result.stderr),
+    );
+  }
+  return sha;
 }
 
 /** Instruction files as they are on the base commit, never as the agent left them. */

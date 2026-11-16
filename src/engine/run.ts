@@ -22,7 +22,7 @@ import { type Logger, silentLogger } from '../core/log.js';
 import { checkContents, checkDiff, type PolicyResult } from '../policy/diff-policy.js';
 import { redactSecrets } from '../policy/secrets.js';
 import type { SandboxHandle, SandboxProvider, SecretBinding } from '../sandbox/sandbox.js';
-import type { BaseRef, PullRequest, SourceControl } from '../scm/scm.js';
+import type { BaseRef, CommitResult, PullRequest, SourceControl } from '../scm/scm.js';
 import { isExecuting, type RunRecord, type RunState, type Store } from '../store/store.js';
 import { RecordingTracker } from '../tracker/recording-tracker.js';
 import type { TicketSnapshot, Tracker } from '../tracker/tracker.js';
@@ -61,6 +61,7 @@ import {
   inspectRoot,
   type Layout,
   layoutFor,
+  mergeBase,
   readInstructionFiles,
   runCommands,
   type StopRequest,
@@ -338,6 +339,8 @@ class TicketRun {
   private sandbox: SandboxHandle | undefined;
   private layout: Layout | undefined;
   private base: BaseRef | undefined;
+  /** The base branch head; for a retry on a PR branch it differs from `base`. */
+  private branchBase: BaseRef | undefined;
   private verify: string[] = [];
   private instructions: InstructionFile[] = [];
   private statusCommentId: string | undefined;
@@ -441,9 +444,11 @@ class TicketRun {
       this.statusCommentId = await this.tracker.postComment(key, pickedUpDoc(ctx));
       this.update({ statusCommentId: this.statusCommentId });
     }
+    // A retry also clears what the earlier run left, such as agent-in-review.
+    const labels = config.jira.labels;
     await this.tracker.updateLabels(key, {
-      add: [config.jira.labels.working],
-      remove: [config.jira.labels.trigger],
+      add: [labels.working],
+      remove: [labels.trigger, labels.in_review, labels.failed, labels.needs_info],
     });
     this.checkCancelled();
     return undefined;
@@ -474,9 +479,11 @@ class TicketRun {
     if (this.run.sandboxId) await this.discardSandbox(this.run.sandboxId);
 
     this.setState('sandbox');
-    const base = await scm.resolveBase(this.settings.repo, this.settings.baseBranch);
+    const { base, instructionsBase } = await this.startPoint();
     this.base = base;
     this.update({ baseSha: base.sha });
+    this.branchBase = instructionsBase;
+    this.audit('start_point', { base, instructionsBase });
     const secrets: SecretBinding[] = [];
     if (this.deps.modelKey.mode === 'egress') {
       const credential: SecretBinding = {
@@ -552,8 +559,17 @@ class TicketRun {
     this.setState('clone');
     this.log.step(`Cloning ${this.settings.repo} at ${base.sha.slice(0, 12)}`);
     const access = await scm.cloneAccess(this.settings.repo);
-    await cloneRepo(sandbox, layout, access, base, this.stepTimeout(10 * 60_000));
-    this.instructions = await readInstructionFiles(sandbox, layout, base.sha);
+    await cloneRepo(
+      sandbox,
+      layout,
+      access,
+      base,
+      this.stepTimeout(10 * 60_000),
+      instructionsBase.sha === base.sha ? undefined : instructionsBase,
+    );
+    // Rule 5: instruction files come from the base branch, never from an agent's work,
+    // including an earlier attempt on the branch a retry continues.
+    this.instructions = await readInstructionFiles(sandbox, layout, instructionsBase.sha);
     this.audit(
       'instructions',
       this.instructions.map((file) => ({ path: file.path, bytes: file.content.length })),
@@ -596,6 +612,33 @@ class TicketRun {
     this.checkCancelled();
   }
 
+  /**
+   * Where the agent starts. Normally the base branch. A retry of a run that published
+   * continues that run's pull request branch, if it still exists (F3).
+   */
+  private async startPoint(): Promise<{ base: BaseRef; instructionsBase: BaseRef }> {
+    const { scm } = this.deps;
+    const baseBranch = await scm.resolveBase(this.settings.repo, this.settings.baseBranch);
+    const inherited = this.run.parentRunId ? this.run.branch : null;
+    if (inherited) {
+      try {
+        const head = await scm.resolveBase(this.settings.repo, inherited);
+        return { base: head, instructionsBase: baseBranch };
+      } catch {
+        this.log.warn(
+          `Branch ${inherited} no longer exists, so this attempt starts from ${this.settings.baseBranch}.`,
+        );
+        this.update({ branch: null });
+      }
+    }
+    return { base: baseBranch, instructionsBase: baseBranch };
+  }
+
+  /** Whether this run adds to an existing pull request branch instead of starting one. */
+  private get continuing(): boolean {
+    return this.base !== undefined && this.base.branch !== this.settings.baseBranch;
+  }
+
   private async reconnect(sandboxId: string, baseSha: string): Promise<void> {
     this.log.step(`Reconnecting to sandbox ${sandboxId}`);
     try {
@@ -608,10 +651,19 @@ class TicketRun {
       );
     }
     this.layout = layoutFor(this.sandbox.homeDir);
-    this.base = { branch: this.run.baseBranch, sha: baseSha };
+    const start = this.deps.store.latestEvent<{ base: BaseRef; instructionsBase: BaseRef }>(
+      this.run.id,
+      'start_point',
+    );
+    this.base = start?.base ?? { branch: this.run.baseBranch, sha: baseSha };
+    this.branchBase = start?.instructionsBase ?? this.base;
     const commands = this.deps.store.latestEvent<{ verify: string[] }>(this.run.id, 'commands');
     this.verify = commands?.verify ?? this.settings.verify ?? [];
-    this.instructions = await readInstructionFiles(this.sandbox, this.layout, baseSha);
+    this.instructions = await readInstructionFiles(
+      this.sandbox,
+      this.layout,
+      start?.instructionsBase.sha ?? baseSha,
+    );
     await this.extendSandbox(this.sandboxTimeout());
   }
 
@@ -664,6 +716,7 @@ class TicketRun {
         workdir: layout.repo,
         verify,
         instructions: this.instructions,
+        ...(this.continuing ? { branch: base.branch } : {}),
       });
 
     // On resume, start in the round that was running, with what earlier rounds produced.
@@ -690,7 +743,10 @@ class TicketRun {
           if (round > 0) {
             throw new StepFailedError('implement', `The prompt for fix round ${round} is missing.`);
           }
-          prompt = buildTaskPrompt(ticket, workflow);
+          prompt = buildTaskPrompt(ticket, workflow, {
+            ...(this.run.hint ? { hint: this.run.hint } : {}),
+            earlierAttempt: this.continuing,
+          });
           this.audit('prompt', { round: 0, system, prompt });
         }
         this.setState('implement', { round });
@@ -776,16 +832,24 @@ class TicketRun {
     const base = this.base as BaseRef;
 
     this.log.step('Collecting and checking the changes');
+    // What this run adds, which is what it commits.
     const collected = await collectChanges(sandbox, layout, base.sha);
+    // What reviewers see. On a retry that is the whole pull request since it forked,
+    // so a protected file an earlier attempt changed still keeps the PR a draft.
+    let reviewed = collected;
+    if (this.continuing && this.branchBase) {
+      const forkPoint = await mergeBase(sandbox, layout, this.branchBase.sha, base.sha);
+      reviewed = await collectChanges(sandbox, layout, forkPoint);
+    }
     const policy = checkContents(
-      collected.contents,
-      checkDiff(collected.files, {
+      reviewed.contents,
+      checkDiff(reviewed.files, {
         protectedPaths: this.settings.protectedPaths,
         maxAddedLines: config.limits.max_added_lines,
         maxChangedFiles: config.limits.max_changed_files,
       }),
     );
-    this.audit('policy', { files: collected.files, findings: policy.findings });
+    this.audit('policy', { files: reviewed.files, findings: policy.findings });
     if (collected.files.length === 0)
       return this.noChanges(ctx, cleanAgentText(stripReport(work.finalText), 1_500));
     if (policy.blocked) {
@@ -823,6 +887,7 @@ class TicketRun {
       criteria,
       checks: work.checks,
       draftReasons,
+      reviewedFiles: reviewed.files.length,
     });
   }
 
@@ -861,6 +926,8 @@ class TicketRun {
     criteria: { criterion: string; met: boolean; evidence: string }[];
     checks: CheckResult[];
     draftReasons: string[];
+    /** Files the pull request changes in total, which a retry's commit may not all touch. */
+    reviewedFiles: number;
   }): Promise<RunResult> {
     const { config, scm } = this.deps;
     const { ctx, collected, policy } = input;
@@ -881,7 +948,7 @@ class TicketRun {
           summary: input.summary,
           addedLines: policy.addedLines,
           removedLines: policy.removedLines,
-          fileCount: collected.files.length,
+          fileCount: input.reviewedFiles,
           criteria: input.criteria,
           checks: input.checks,
           findings: policy.findings,
@@ -904,11 +971,17 @@ class TicketRun {
       // V3, T6: a run resumed after a crash finds its own branch, commit and PR instead
       // of making new ones. A branch counts as its own only if the head commit says so.
       let headSha = this.run.headSha;
+      let createBranch = true;
       if (!headSha && branch) {
         const head = await scm.branchHead(this.settings.repo, branch);
         if (head?.message.includes(`Lockkeeper-Run: ${this.run.id}`)) {
           headSha = head.sha;
           this.update({ headSha });
+        } else if (head && head.sha === input.base.sha) {
+          // A retry adds a commit on top of the branch it cloned (fast-forward only, V3).
+          createBranch = false;
+        } else if (head && this.continuing) {
+          throw branchMovedError(branch);
         } else if (head) {
           branch = null;
         }
@@ -918,14 +991,24 @@ class TicketRun {
         this.update({ branch });
         // V3: commits and the PR are created here, under the App identity, never in the sandbox.
         const message = `${title}\n\n${input.summary}\n\nTicket: ${ticket.url}\nLockkeeper-Run: ${this.run.id}\nAgent: ${this.deps.agent.displayName}\n`;
-        const commit = await scm.commit({
-          repo: this.settings.repo,
-          branch,
-          parentSha: input.base.sha,
-          message,
-          changes: collected.changes,
-          createBranch: true,
-        });
+        let commit: CommitResult;
+        try {
+          commit = await scm.commit({
+            repo: this.settings.repo,
+            branch,
+            parentSha: input.base.sha,
+            message,
+            changes: collected.changes,
+            createBranch,
+          });
+        } catch (error) {
+          // Someone pushed between the check above and the commit: say so plainly.
+          const moved =
+            !createBranch &&
+            (await scm.branchHead(this.settings.repo, branch).catch(() => undefined));
+          if (moved && moved.sha !== input.base.sha) throw branchMovedError(branch);
+          throw error;
+        }
         this.update({ headSha: commit.sha });
         this.audit('commit', {
           sha: commit.sha,
@@ -941,19 +1024,23 @@ class TicketRun {
         pr = { url: this.run.prUrl, number: this.run.prNumber, draft, state: 'open' };
       } else {
         const existing = await scm.findPullRequest(this.settings.repo, head);
-        pr =
-          existing ??
-          (await scm.openPullRequest({
+        if (existing?.state === 'open') {
+          // A retry, or a restart after opening it: bring the open PR up to date.
+          pr = await scm.updatePullRequest(this.settings.repo, existing.number, { body, draft });
+          this.log.step(`Updated pull request ${pr.url}`);
+        } else {
+          pr = await scm.openPullRequest({
             repo: this.settings.repo,
             head,
             base: this.settings.baseBranch,
             title,
             body,
             draft,
-          }));
+          });
+          this.log.step(`Opened ${pr.draft || draft ? 'draft ' : ''}pull request ${pr.url}`);
+        }
         this.update({ prNumber: pr.number, prUrl: pr.url });
         this.audit('pull_request', pr);
-        this.log.step(`Opened ${pr.draft || draft ? 'draft ' : ''}pull request ${pr.url}`);
       }
     }
     const branchShown = branch as string;
@@ -1450,6 +1537,13 @@ class TicketRun {
   private audit(kind: string, data: unknown): void {
     this.deps.store.appendEvent(this.run.id, kind, data, new Date(this.now()));
   }
+}
+
+function branchMovedError(branch: string): StepFailedError {
+  return new StepFailedError(
+    'publish',
+    `Someone pushed to ${branch} while the agent worked, so Lockkeeper did not add to it. Comment /agent retry to try again on top of the new commits.`,
+  );
 }
 
 export function describeFailure(error: Error): string {

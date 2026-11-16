@@ -289,6 +289,37 @@ export class GitHubSourceControl implements SourceControl {
     }
   }
 
+  async updatePullRequest(
+    repo: string,
+    number: number,
+    update: { title?: string; body?: string; draft?: boolean },
+  ): Promise<PullRequest> {
+    const { owner, name } = parseRepo(repo);
+    const client = await this.client(repo);
+    const { data } = await client.rest.pulls.update({
+      owner,
+      repo: name,
+      pull_number: number,
+      ...(update.title !== undefined ? { title: update.title } : {}),
+      ...(update.body !== undefined ? { body: update.body } : {}),
+    });
+    let draft = Boolean(data.draft);
+    if (update.draft !== undefined && update.draft !== draft) {
+      // The REST API cannot change a pull request's draft state; GraphQL can.
+      const mutation = update.draft ? 'convertPullRequestToDraft' : 'markPullRequestReadyForReview';
+      try {
+        await client.graphql(
+          `mutation($id: ID!) { ${mutation}(input: { pullRequestId: $id }) { clientMutationId } }`,
+          { id: data.node_id },
+        );
+        draft = update.draft;
+      } catch {
+        // Repositories without draft pull requests keep their state; the body says why.
+      }
+    }
+    return { number: data.number, url: data.html_url, draft, state: data.state };
+  }
+
   async findPullRequest(repo: string, head: string): Promise<PullRequest | undefined> {
     const { owner, name } = parseRepo(repo);
     const client = await this.client(repo);

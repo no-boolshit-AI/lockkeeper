@@ -3,6 +3,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { parseConfig } from '../../src/config/load.js';
 import type { Config } from '../../src/config/schema.js';
+import { LockkeeperError } from '../../src/core/errors.js';
 import type {
   BaseRef,
   BranchHead,
@@ -86,26 +87,50 @@ export function makeRemoteRepo(
 export class FakeScm implements SourceControl {
   readonly kind = 'fake-github';
   readonly commits: CommitInput[] = [];
-  readonly pullRequests: PullRequestInput[] = [];
-  readonly existingBranches = new Set<string>();
-  /** Head commits by branch, for branches that exist. */
-  readonly heads = new Map<string, BranchHead>();
+  readonly pullRequests: (PullRequestInput & { number: number; state: string })[] = [];
+  readonly updates: { number: number; body?: string; draft?: boolean }[] = [];
   /** Called before and after each write, so a test can simulate a crash at that point. */
   beforeWrite: ((action: 'commit' | 'pull_request') => void) | undefined;
   afterWrite: ((action: 'commit' | 'pull_request') => void) | undefined;
+  private nextPr = 7;
 
+  /** Commits land in the bare repository for real, so a later run can clone them. */
   constructor(
     private readonly bare: string,
     private readonly baseSha: string,
   ) {}
 
-  async branchHead(_repo: string, branch: string): Promise<BranchHead | undefined> {
-    if (!this.existingBranches.has(branch)) return undefined;
-    return this.heads.get(branch) ?? { sha: 'f'.repeat(40), message: 'Someone else' };
+  private git(
+    args: string[],
+    options: { input?: Buffer; env?: Record<string, string> } = {},
+  ): string {
+    return execFileSync('git', args, {
+      env: { ...gitEnv, GIT_DIR: this.bare, ...options.env },
+      encoding: 'utf8',
+      ...(options.input ? { input: options.input } : {}),
+    }).trim();
+  }
+
+  private ref(branch: string): string | undefined {
+    try {
+      return this.git(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}^{commit}`]);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Make a branch exist, as if someone else had pushed it. */
+  addBranch(branch: string, message = 'Someone else'): string {
+    const tree = this.git(['rev-parse', `${this.baseSha}^{tree}`]);
+    const sha = this.git(['commit-tree', tree, '-p', this.baseSha, '-m', message]);
+    this.git(['update-ref', `refs/heads/${branch}`, sha]);
+    return sha;
   }
 
   async resolveBase(_repo: string, branch: string): Promise<BaseRef> {
-    return { branch, sha: this.baseSha };
+    const sha = this.ref(branch);
+    if (!sha) throw new LockkeeperError(`Branch ${branch} does not exist in acme/demo.`);
+    return { branch, sha };
   }
 
   async cloneAccess(): Promise<CloneAccess> {
@@ -117,36 +142,80 @@ export class FakeScm implements SourceControl {
   }
 
   async branchExists(_repo: string, branch: string): Promise<boolean> {
-    return this.existingBranches.has(branch);
+    return this.ref(branch) !== undefined;
   }
 
+  async branchHead(_repo: string, branch: string): Promise<BranchHead | undefined> {
+    const sha = this.ref(branch);
+    return sha ? { sha, message: this.git(['log', '-1', '--format=%B', sha]) } : undefined;
+  }
+
+  /** Like the Git Data API: blobs, a tree on the parent's tree, a commit, then the ref. */
   async commit(input: CommitInput): Promise<CommitResult> {
     this.beforeWrite?.('commit');
+    const env = { GIT_INDEX_FILE: join(this.bare, `index-${this.commits.length}-${Date.now()}`) };
+    this.git(['read-tree', input.parentSha], { env });
+    for (const change of input.changes) {
+      if (change.action === 'delete') {
+        this.git(['update-index', '--force-remove', '--', change.path], { env });
+        continue;
+      }
+      const blob = this.git(['hash-object', '-w', '--stdin'], {
+        input: Buffer.from(change.content),
+      });
+      this.git(['update-index', '--add', '--cacheinfo', `${change.mode},${blob},${change.path}`], {
+        env,
+      });
+    }
+    const tree = this.git(['write-tree'], { env });
+    const sha = this.git(['commit-tree', tree, '-p', input.parentSha, '-m', input.message]);
+    const current = this.ref(input.branch);
+    // GitHub's rules: creating a branch fails if it exists; updates must fast-forward.
+    if (input.createBranch && current) throw new Error(`Reference already exists: ${input.branch}`);
+    if (!input.createBranch && current !== input.parentSha)
+      throw new Error(`Update is not a fast forward: ${input.branch}`);
+    this.git(['update-ref', `refs/heads/${input.branch}`, sha]);
     this.commits.push(input);
-    this.existingBranches.add(input.branch);
-    const sha = 'c'.repeat(40);
-    this.heads.set(input.branch, { sha, message: input.message });
     this.afterWrite?.('commit');
-    return { sha, url: 'https://github.com/acme/demo/commit/ccc', verified: true };
+    return { sha, url: `https://github.com/acme/demo/commit/${sha}`, verified: true };
+  }
+
+  private toPr(pr: { number: number; draft: boolean; state: string }): PullRequest {
+    return {
+      number: pr.number,
+      url: `https://github.com/acme/demo/pull/${pr.number}`,
+      draft: pr.draft,
+      state: pr.state,
+    };
   }
 
   async openPullRequest(input: PullRequestInput): Promise<PullRequest> {
     this.beforeWrite?.('pull_request');
-    this.pullRequests.push(input);
+    if (this.pullRequests.some((pr) => pr.head === input.head && pr.state === 'open'))
+      throw new Error(`A pull request already exists for ${input.head}.`);
+    const pr = { ...input, number: this.nextPr++, state: 'open' };
+    this.pullRequests.push(pr);
     this.afterWrite?.('pull_request');
-    return {
-      number: 7,
-      url: 'https://github.com/acme/demo/pull/7',
-      draft: input.draft,
-      state: 'open',
-    };
+    return this.toPr(pr);
   }
 
   async findPullRequest(_repo: string, head: string): Promise<PullRequest | undefined> {
-    const pr = this.pullRequests.find((entry) => entry.head === head);
-    return pr
-      ? { number: 7, url: 'https://github.com/acme/demo/pull/7', draft: pr.draft, state: 'open' }
-      : undefined;
+    const pr = [...this.pullRequests].reverse().find((entry) => entry.head === head);
+    return pr ? this.toPr(pr) : undefined;
+  }
+
+  async updatePullRequest(
+    _repo: string,
+    number: number,
+    update: { title?: string; body?: string; draft?: boolean },
+  ): Promise<PullRequest> {
+    const pr = this.pullRequests.find((entry) => entry.number === number);
+    if (!pr) throw new Error(`No pull request ${number}`);
+    this.updates.push({ number, ...update });
+    if (update.title !== undefined) pr.title = update.title;
+    if (update.body !== undefined) pr.body = update.body;
+    if (update.draft !== undefined) pr.draft = update.draft;
+    return this.toPr(pr);
   }
 }
 

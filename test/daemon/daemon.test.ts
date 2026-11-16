@@ -236,6 +236,42 @@ describe('the daemon', () => {
     expect(h.sandboxes.sandboxes).toHaveLength(1);
   });
 
+  it('starts another attempt on the same pull request when an allowed person comments /agent retry', async () => {
+    h = harness({ allowUsers: ['tech-leads'] });
+    h.jira.groups.set('acc-maria', ['tech-leads']);
+    h.jira.addIssue('DEMO-1');
+    h.jira.addLabel('DEMO-1', 'agent', maria);
+    await h.daemon.tick();
+    await h.daemon.settle();
+    const first = h.runFor('DEMO-1');
+    expect(first?.state).toBe('in_review');
+
+    // Someone not on the list is ignored.
+    h.jira.comment('DEMO-1', bob, '/agent retry do it differently');
+    await h.daemon.tick();
+    expect(h.runFor('DEMO-1')?.id).toBe(first?.id);
+
+    const round = { writes: { 'hello.txt': 'hello there\n' }, text: REPORT };
+    writeFileSync(join(h.root, 'agent-script.json'), JSON.stringify({ rounds: [round] }));
+    h.jira.comment('DEMO-1', maria, '/agent retry Make it friendlier.');
+    await h.daemon.tick();
+    await h.daemon.settle();
+
+    const second = h.runFor('DEMO-1');
+    expect(second).toMatchObject({
+      state: 'in_review',
+      parentRunId: first?.id,
+      hint: 'Make it friendlier.',
+      branch: first?.branch,
+      triggeredBy: 'jira:Maria',
+    });
+    expect(h.store.getRun(first?.id ?? '')?.state).toBe('done');
+    expect(h.scm.pullRequests).toHaveLength(1);
+    expect(h.scm.commits.map((commit) => commit.createBranch)).toEqual([true, false]);
+    expect(h.scm.updates).toHaveLength(1);
+    expect(h.jira.issue('DEMO-1').labels).toEqual(['agent-in-review']);
+  });
+
   it('resumes the runs a previous process left, and leaves its own to resume', async () => {
     h = harness({ sleepMs: 1_500 });
     h.jira.addIssue('DEMO-1');

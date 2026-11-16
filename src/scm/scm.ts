@@ -82,5 +82,12 @@ export interface SourceControl {
   branchHead(repo: string, branch: string): Promise<BranchHead | undefined>;
   commit(input: CommitInput): Promise<CommitResult>;
   openPullRequest(input: PullRequestInput): Promise<PullRequest>;
+  /** The newest pull request from a branch, open or not. */
   findPullRequest(repo: string, head: string): Promise<PullRequest | undefined>;
+  /** Change a pull request's title, body or draft state, as when a retry adds a commit. */
+  updatePullRequest(
+    repo: string,
+    number: number,
+    update: { title?: string; body?: string; draft?: boolean },
+  ): Promise<PullRequest>;
 }

@@ -97,7 +97,7 @@ lockkeeper start
 
 Now adding the `agent` label to a ticket starts a run within a minute. Lockkeeper checks the ticket's history to see who added the label. Only people on `jira.allow_users` count, by email, account ID or group. With an empty list, anyone in your Jira organisation does. Apps and customer accounts never do.
 
-From the ticket, people can stop a run by removing its label or by commenting `/agent stop`. Stopping the service with Ctrl-C pauses runs in progress, and `lockkeeper start` picks them up where they stopped.
+From the ticket, people can stop a run by removing its label or by commenting `/agent stop`. They can comment `/agent retry` with a note for the agent to start another attempt. If the last run opened a pull request, the new attempt adds to that branch and updates the same pull request. Stopping the service with Ctrl-C pauses runs in progress, and `lockkeeper start` picks them up where they stopped.
 
 ## Commands
 

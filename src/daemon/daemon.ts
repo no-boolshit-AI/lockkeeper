@@ -11,8 +11,8 @@ import {
   resumeRun,
   type TriggerInfo,
 } from '../engine/run.js';
-import type { RunRecord } from '../store/store.js';
-import type { LabelEvent, TicketRef } from '../tracker/tracker.js';
+import type { RunRecord, RunState } from '../store/store.js';
+import type { LabelEvent, TicketComment, TicketRef } from '../tracker/tracker.js';
 
 export interface DaemonOptions {
   /** Milliseconds between polls of Jira. */
@@ -29,6 +29,10 @@ interface RunningRun {
 }
 
 const projectOf = (key: string) => key.slice(0, key.lastIndexOf('-'));
+
+/** Runs whose ticket accepts `/agent retry`, and how long after the run it does. */
+const RETRYABLE: readonly RunState[] = ['in_review', 'failed', 'cancelled', 'done', 'declined'];
+const RETRY_WINDOW_MS = 14 * 24 * 60 * 60_000;
 
 /**
  * The long-running service behind `lockkeeper start` (T1, T2, T6, E7, F3). It polls
@@ -49,6 +53,7 @@ export class Daemon {
   private readonly running = new Map<string, RunningRun>();
   private readonly lastError = new Map<string, string>();
   private stopping = false;
+  private lastRetryScan: number | undefined;
   private wake: (() => void) | undefined;
 
   constructor(
@@ -101,6 +106,7 @@ export class Daemon {
   async tick(): Promise<void> {
     await this.guard('looking for labelled tickets', () => this.pickUp());
     await this.guard('checking active runs', () => this.watch());
+    await this.guard('checking for retries', () => this.watchRetries());
     await this.guard('starting queued runs', () => this.startQueued());
   }
 
@@ -249,21 +255,134 @@ export class Daemon {
 
   /** Each ticket's labels now. A ticket that cannot be read is left out, not stopped. */
   private async currentLabels(keys: string[]): Promise<Map<string, string[]>> {
+    const refs = await this.findTickets(keys);
+    return new Map(refs.map((ref) => [ref.key, ref.labels]));
+  }
+
+  /** These tickets, narrowed by an optional JQL clause. Unreadable ones are left out. */
+  private async findTickets(keys: string[], clause = ''): Promise<TicketRef[]> {
     const { tracker } = this.deps;
-    const toMap = (refs: TicketRef[]) => new Map(refs.map((ref) => [ref.key, ref.labels]));
+    const extra = clause ? ` AND ${clause}` : '';
     try {
-      return toMap(await tracker.search(`key in (${keys.join(', ')})`, keys.length));
+      return await tracker.search(`key in (${keys.join(', ')})${extra}`, keys.length);
     } catch {
       // Jira rejects the whole query if one ticket was deleted or moved: ask one by one.
       const found: TicketRef[] = [];
       for (const key of keys) {
         try {
-          found.push(...(await tracker.search(`key = ${key}`, 1)));
+          found.push(...(await tracker.search(`key = ${key}${extra}`, 1)));
         } catch (error) {
-          this.warnOnce(`labels:${key}`, `Could not read ${key}: ${errorMessage(error)}`);
+          this.warnOnce(`read:${key}`, `Could not read ${key}: ${errorMessage(error)}`);
         }
       }
-      return toMap(found);
+      return found;
+    }
+  }
+
+  /**
+   * F3: `/agent retry <hint>` on a ticket whose latest run finished or is in review
+   * starts a new run. Only tickets changed since the last look are read.
+   */
+  private async watchRetries(): Promise<void> {
+    const { store } = this.deps;
+    const runs = store
+      .latestRuns(new Date(this.now() - RETRY_WINDOW_MS), RETRYABLE)
+      .filter((run) => !this.running.has(run.id));
+    if (runs.length === 0) return;
+    const started = this.now();
+    const minutes =
+      this.lastRetryScan === undefined
+        ? RETRY_WINDOW_MS / 60_000
+        : Math.ceil((started - this.lastRetryScan) / 60_000) + 1;
+    const changed = new Set(
+      (
+        await this.findTickets(
+          [...new Set(runs.map((run) => run.ticketKey))],
+          `updated >= -${minutes}m`,
+        )
+      ).map((ref) => ref.key),
+    );
+    for (const run of runs) {
+      if (this.stopping) return;
+      if (changed.has(run.ticketKey)) await this.readRetry(run);
+    }
+    this.lastRetryScan = started;
+  }
+
+  private async readRetry(run: RunRecord): Promise<void> {
+    const { store, tracker } = this.deps;
+    const comments = await tracker.newComments(run.ticketKey, {
+      ...(run.commentsSeen ? { afterId: run.commentsSeen } : {}),
+      since: run.finishedAt ?? run.updatedAt,
+    });
+    const newest = comments.at(-1)?.id;
+    if (!newest) return;
+    store.updateRun(run.id, { commentsSeen: newest });
+    for (const comment of comments) {
+      const command = parseCommand(comment.body);
+      if (command?.kind !== 'retry') continue;
+      const verdict = await this.authorizer.check(comment.author);
+      if (!verdict.allowed) {
+        this.log.warn(
+          `${run.ticketKey}: ignored /agent retry from ${comment.author.displayName}. ${verdict.reason}`,
+        );
+        continue;
+      }
+      await this.retry(run, comment, command.hint);
+      return;
+    }
+  }
+
+  private async retry(previous: RunRecord, comment: TicketComment, hint: string): Promise<void> {
+    const { store, config, tracker, agent, sandboxes } = this.deps;
+    const settings = projectSettings(config, projectOf(previous.ticketKey));
+    if (!settings) return;
+    const now = new Date(this.now());
+    if (previous.state === 'in_review') {
+      // The new run takes over the ticket and the pull request.
+      store.updateRun(previous.id, { state: 'done', finishedAt: now.toISOString() }, now);
+      store.appendEvent(previous.id, 'superseded', { by: comment.author.displayName }, now);
+      if (previous.sandboxId) {
+        try {
+          await (await sandboxes.connect(previous.sandboxId)).destroy();
+        } catch (error) {
+          this.log.debug(`Could not delete sandbox ${previous.sandboxId}: ${errorMessage(error)}`);
+        }
+      }
+    }
+    // A run that published continues on its branch; anything else starts afresh.
+    const branch = previous.headSha && previous.branch ? previous.branch : null;
+    const trigger: TriggerInfo = {
+      source: 'retry',
+      at: comment.created,
+      eventId: `comment:${comment.id}`,
+      by: { accountId: comment.author.accountId, displayName: comment.author.displayName },
+    };
+    try {
+      const run = store.createRun(
+        {
+          ticketKey: previous.ticketKey,
+          tracker: tracker.kind,
+          repo: previous.repo,
+          baseBranch: settings.baseBranch,
+          workflow: previous.workflow,
+          agent: agent.id,
+          triggeredBy: `jira:${comment.author.displayName}`,
+          triggerInfo: JSON.stringify(trigger),
+          state: 'queued',
+          parentRunId: previous.id,
+          commentsSeen: comment.id,
+          ...(hint ? { hint } : {}),
+          ...(branch ? { branch } : {}),
+        },
+        now,
+      );
+      store.appendEvent(run.id, 'trigger', trigger, now);
+      this.log.step(
+        `${previous.ticketKey}: ${comment.author.displayName} asked for another attempt${branch ? ` on ${branch}` : ''}`,
+      );
+    } catch (error) {
+      if (!(error instanceof AlreadyActiveError)) throw error;
     }
   }
 
