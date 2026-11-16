@@ -14,7 +14,7 @@ import {
 } from '../core/doc.js';
 import type { PolicyFinding } from '../policy/diff-policy.js';
 import { sanitizeAgentText } from '../policy/secrets.js';
-import type { TicketSnapshot } from '../tracker/tracker.js';
+import type { Person, TicketSnapshot } from '../tracker/tracker.js';
 import type { CriterionResult } from './prompts.js';
 import type { CheckResult } from './workspace.js';
 
@@ -29,6 +29,8 @@ export interface RunContext {
   runId: string;
   agentName: string;
   limits: { costUsd: number; minutes: number };
+  /** Who asked for the run, such as the person who added the label. Notified at the end. */
+  requester?: Person;
 }
 
 export function formatCost(usd: number | undefined): string {
@@ -186,16 +188,7 @@ export function finalNoticeDoc(
     | { kind: 'no_changes' }
     | { kind: 'failed'; reason: string },
 ): Doc {
-  const lead: Inline[] = ctx.ticket.reporter
-    ? [
-        {
-          kind: 'mention',
-          id: ctx.ticket.reporter.accountId,
-          name: ctx.ticket.reporter.displayName,
-        },
-        text(' '),
-      ]
-    : [];
+  const lead = mentionOf(ctx.requester ?? ctx.ticket.reporter);
   switch (notice.kind) {
     case 'pr':
       return [
@@ -229,13 +222,44 @@ export function finalNoticeDoc(
   }
 }
 
-export function refusedDoc(ctx: Pick<RunContext, 'ticket'>, reason: string, hint?: string): Doc {
-  const doc: Doc = [
-    paragraph(bold('Lockkeeper'), ` · ${ctx.ticket.key} · not started`),
-    paragraph(reason),
-  ];
+function mentionOf(person: Person | undefined): Inline[] {
+  return person
+    ? [{ kind: 'mention', id: person.accountId, name: person.displayName }, text(' ')]
+    : [];
+}
+
+export function refusedDoc(key: string, reason: string, hint?: string): Doc {
+  const doc: Doc = [paragraph(bold('Lockkeeper'), ` · ${key} · not started`), paragraph(reason)];
   if (hint) doc.push(paragraph(hint));
   return doc;
+}
+
+/** The status comment for a run waiting for a free slot (T1: feedback within a minute). */
+export function queuedDoc(input: {
+  key: string;
+  runId: string;
+  slots: number;
+  agentName: string;
+  limits: RunContext['limits'];
+}): Doc {
+  return [
+    paragraph(bold('Lockkeeper'), ` · ${input.key} · queued`),
+    paragraph(
+      `Picked up. All ${input.slots} run slots are busy, so this run starts when one is free. This comment is updated as the run goes.`,
+    ),
+    paragraph(
+      `Run ${input.runId} · ${input.agentName} · limits: ${formatCost(input.limits.costUsd)}, ${input.limits.minutes} min`,
+    ),
+  ];
+}
+
+/** The status comment for a run stopped before it started. */
+export function stoppedBeforeStartDoc(key: string, reason: string, runId: string): Doc {
+  return [
+    paragraph(bold('Lockkeeper'), ` · ${key} · stopped`),
+    paragraph(reason),
+    paragraph(`Run ${runId}`),
+  ];
 }
 
 // ---------------------------------------------------------------------------

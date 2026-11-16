@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { CapExceededError, LockkeeperError } from '../../src/core/errors.js';
+import { Authorizer } from '../../src/engine/authorize.js';
+import { parseCommand } from '../../src/engine/commands.js';
 import { detectCommands } from '../../src/engine/detect.js';
 import { allowList } from '../../src/engine/domains.js';
 import {
@@ -19,6 +21,7 @@ import {
 } from '../../src/engine/prompts.js';
 import { describeFailure } from '../../src/engine/run.js';
 import { tail } from '../../src/engine/workspace.js';
+import type { Person } from '../../src/tracker/tracker.js';
 import { ticketFixture } from '../support/fakes.js';
 
 const A = 'a'.repeat(40);
@@ -204,5 +207,74 @@ describe('small helpers', () => {
     expect(describeFailure(new Error(`boom ghp_${'a'.repeat(36)}`))).toBe(
       'Lockkeeper hit an unexpected error: boom [redacted github-token]',
     );
+  });
+});
+
+describe('ticket commands', () => {
+  it('reads /agent commands at the start of a comment', () => {
+    expect(parseCommand('/agent stop')).toEqual({ kind: 'stop' });
+    expect(parseCommand('  `/agent stop`  ')).toEqual({ kind: 'stop' });
+    expect(parseCommand('/agent cancel please')).toEqual({ kind: 'stop' });
+    expect(parseCommand('/agent retry use the v2 API\nand keep the old one')).toEqual({
+      kind: 'retry',
+      hint: 'use the v2 API\nand keep the old one',
+    });
+    expect(parseCommand('**/agent go** 1. Euro only. 2. Yes')).toEqual({
+      kind: 'go',
+      text: '1. Euro only. 2. Yes',
+    });
+    expect(parseCommand('/agent')).toEqual({ kind: 'unknown', word: '(none)' });
+    expect(parseCommand('/agent dance')).toEqual({ kind: 'unknown', word: 'dance' });
+  });
+
+  it('ignores text that only mentions a command', () => {
+    expect(parseCommand('Please do not /agent stop yet')).toBeUndefined();
+    expect(parseCommand('/agentsmith')).toBeUndefined();
+    expect(parseCommand('')).toBeUndefined();
+  });
+});
+
+describe('the allow-list (T2)', () => {
+  const maria: Person = { accountId: 'acc-maria', displayName: 'Maria', accountType: 'atlassian' };
+  const lookups = {
+    userGroups: async (id: string) => (id === 'acc-maria' ? ['Tech-Leads'] : []),
+    findUsers: async (query: string) =>
+      query === 'bob@acme.com' ? [{ accountId: 'acc-bob', displayName: 'Bob' }] : [],
+  };
+
+  it('never takes requests from apps or external accounts', async () => {
+    const open = new Authorizer(lookups, []);
+    expect(open.open).toBe(true);
+    expect(await open.check(maria)).toEqual({ allowed: true });
+    const app = await open.check({ accountId: 'x', displayName: 'Bot', accountType: 'app' });
+    expect(app).toMatchObject({ allowed: false, reason: expect.stringContaining('an app') });
+    const customer = await open.check({
+      accountId: 'y',
+      displayName: 'Cy',
+      accountType: 'customer',
+    });
+    expect(customer).toMatchObject({ allowed: false, reason: expect.stringContaining('external') });
+  });
+
+  it('matches account IDs, email addresses and group names', async () => {
+    const byGroup = new Authorizer(lookups, ['tech-leads']);
+    expect(await byGroup.check(maria)).toEqual({ allowed: true });
+    const bob: Person = { accountId: 'acc-bob', displayName: 'Bob', accountType: 'atlassian' };
+    expect(await byGroup.check(bob)).toMatchObject({
+      allowed: false,
+      reason: "Bob is not on Lockkeeper's allow-list.",
+    });
+    // Jira often hides email addresses, so the address is looked up.
+    expect(await new Authorizer(lookups, ['bob@acme.com']).check(bob)).toEqual({ allowed: true });
+    expect(
+      await new Authorizer(lookups, ['MARIA@acme.com']).check({
+        ...maria,
+        email: 'maria@acme.com',
+      }),
+    ).toEqual({ allowed: true });
+    const id = '712020:f4b1e929-369a-4ae6-abfa-7d9baf01ea5d';
+    expect(await new Authorizer(lookups, [id]).check({ ...bob, accountId: id })).toEqual({
+      allowed: true,
+    });
   });
 });

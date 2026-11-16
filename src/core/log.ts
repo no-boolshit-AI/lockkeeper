@@ -27,6 +27,17 @@ export function consoleLogger(
   };
 }
 
+/** Prefix every line, such as with a ticket key when several runs share one terminal. */
+export function prefixedLogger(log: Logger, prefix: string): Logger {
+  return {
+    step: (message) => log.step(`${prefix} ${message}`),
+    info: (message) => log.info(`${prefix} ${message}`),
+    warn: (message) => log.warn(`${prefix} ${message}`),
+    error: (message) => log.error(`${prefix} ${message}`),
+    debug: (message) => log.debug(`${prefix} ${message}`),
+  };
+}
+
 export const silentLogger: Logger = {
   step: () => {},
   info: () => {},

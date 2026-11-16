@@ -7,6 +7,7 @@ import { projectSettings } from '../config/schema.js';
 import { ENV } from '../config/secrets.js';
 import { LockkeeperError } from '../core/errors.js';
 import { consoleLogger } from '../core/log.js';
+import { Daemon } from '../daemon/daemon.js';
 import { type RunResult, runTicket } from '../engine/run.js';
 import {
   buildRunDeps,
@@ -67,6 +68,44 @@ program
       });
       printResult(result);
       if (result.outcome === 'failed') process.exitCode = 1;
+    } finally {
+      process.off('SIGINT', onSignal);
+      process.off('SIGTERM', onSignal);
+      close();
+    }
+  });
+
+program
+  .command('start')
+  .description('Watch Jira for labelled tickets and run them, until stopped with Ctrl-C')
+  .action(async () => {
+    const globals = program.opts<{ config?: string; verbose?: boolean }>();
+    const log = consoleLogger({ verbose: Boolean(globals.verbose) });
+    const context = loadContext(globals.config);
+    const { config } = context.loaded;
+    const { deps, close } = await buildRunDeps(context, log);
+    const daemon = new Daemon(deps, { pollMs: config.jira.poll_seconds * 1000 });
+    log.step(
+      `Watching ${Object.keys(config.projects).join(', ')} for the "${config.jira.labels.trigger}" label every ${config.jira.poll_seconds} s. Press Ctrl-C to stop.`,
+    );
+    if (daemon.openToAll) {
+      log.warn(
+        'jira.allow_users is empty, so any internal Jira user in these projects can start a run.',
+      );
+    }
+    let interrupts = 0;
+    const onSignal = () => {
+      interrupts += 1;
+      if (interrupts > 1) process.exit(130);
+      log.warn(
+        'Stopping. Runs in progress pause and continue at the next start (press Ctrl-C again to quit at once)…',
+      );
+      daemon.stop();
+    };
+    process.on('SIGINT', onSignal);
+    process.on('SIGTERM', onSignal);
+    try {
+      await daemon.run();
     } finally {
       process.off('SIGINT', onSignal);
       process.off('SIGTERM', onSignal);

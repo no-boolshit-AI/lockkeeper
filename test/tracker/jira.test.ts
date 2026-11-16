@@ -411,3 +411,156 @@ describe('the Jira tracker', () => {
     expect(tracker.ticketUrl('A-1')).toBe('https://a.atlassian.net/browse/A-1');
   });
 });
+
+describe('the Jira tracker as a trigger source', () => {
+  const people = {
+    me: { accountId: 'acc-me', displayName: 'Eugen', accountType: 'atlassian' },
+    bob: { accountId: 'acc-bob', displayName: 'Bob', accountType: 'atlassian' },
+    maria: { accountId: 'acc-maria', displayName: 'Maria', accountType: 'atlassian' },
+  };
+  const adf = (value: string) => doc(para(txt(value)));
+
+  function trackerWith(route: (url: URL, init?: RequestInit) => Response) {
+    const bodies: unknown[] = [];
+    const fetch = vi.fn(async (url: URL | string, init?: RequestInit) => {
+      if (init?.body) bodies.push(JSON.parse(String(init.body)));
+      return route(new URL(String(url)), init);
+    });
+    const tracker = new JiraTracker(
+      new JiraClient({
+        site: 'a.atlassian.net',
+        email: 'e',
+        token: 't',
+        fetch: fetch as unknown as typeof globalThis.fetch,
+      }),
+      { site: 'a.atlassian.net' },
+    );
+    return { tracker, bodies };
+  }
+
+  it('searches with JQL and follows page tokens', async () => {
+    const { tracker, bodies } = trackerWith((url) => {
+      expect(url.pathname).toBe('/rest/api/3/search/jql');
+      return bodies.length === 1
+        ? response(200, {
+            issues: [{ key: 'A-1', fields: { labels: ['agent'], updated: 'u1' } }],
+            nextPageToken: 'next',
+          })
+        : response(200, { issues: [{ key: 'A-2', fields: { updated: 'u2' } }] });
+    });
+    expect(await tracker.search('labels = agent', 10)).toEqual([
+      { key: 'A-1', labels: ['agent'], updated: 'u1' },
+      { key: 'A-2', labels: [], updated: 'u2' },
+    ]);
+    expect(bodies[0]).toEqual({
+      jql: 'labels = agent',
+      fields: ['labels', 'updated'],
+      maxResults: 10,
+    });
+    expect(bodies[1]).toMatchObject({ nextPageToken: 'next', maxResults: 9 });
+  });
+
+  it('finds who last added a label, from the history or from the creator', async () => {
+    const histories = [
+      {
+        id: '10',
+        author: people.bob,
+        created: '2026-11-16T09:00:00.000+0000',
+        items: [{ field: 'labels', fieldId: 'labels', fromString: '', toString: 'agent' }],
+      },
+      {
+        id: '11',
+        author: people.bob,
+        created: '2026-11-16T09:30:00.000+0000',
+        items: [{ field: 'labels', fieldId: 'labels', fromString: 'agent', toString: '' }],
+      },
+      {
+        id: '12',
+        author: people.maria,
+        created: '2026-11-16T10:00:00.000+0000',
+        items: [
+          { field: 'status', fromString: 'To Do', toString: 'In Progress' },
+          { field: 'labels', fieldId: 'labels', fromString: 'ui', toString: 'agent ui' },
+        ],
+      },
+      // An item without toString must not break the scan.
+      { id: '13', author: people.bob, created: 'x', items: [{ field: 'labels' }] },
+    ];
+    const { tracker } = trackerWith((url) => {
+      if (url.pathname === '/rest/api/3/issue/A-1/changelog')
+        return response(200, { values: histories, total: 4, isLast: true });
+      if (url.pathname.endsWith('/changelog')) return response(200, { values: [], total: 0 });
+      if (url.pathname === '/rest/api/3/issue/A-2')
+        return response(200, {
+          key: 'A-2',
+          fields: {
+            labels: ['agent'],
+            creator: people.me,
+            created: '2026-11-15T08:00:00.000+0000',
+          },
+        });
+      return response(200, { key: 'A-3', fields: { labels: [], creator: people.me } });
+    });
+    expect(await tracker.labelAdded('A-1', 'agent')).toEqual({
+      label: 'agent',
+      by: people.maria,
+      at: '2026-11-16T10:00:00.000+0000',
+      id: 'history:12',
+    });
+    expect(await tracker.labelAdded('A-2', 'agent')).toMatchObject({
+      id: 'created',
+      by: people.me,
+    });
+    expect(await tracker.labelAdded('A-3', 'agent')).toBeUndefined();
+  });
+
+  it('lists new comments, keeping commands but not Lockkeeper status comments', async () => {
+    const comments = [
+      {
+        id: '100',
+        author: people.me,
+        created: '2026-11-16T09:00:00.000+0000',
+        body: adf('Lockkeeper · A-1 · working'),
+      },
+      {
+        id: '101',
+        author: people.me,
+        created: '2026-11-16T10:00:00.000+0000',
+        body: adf('/agent stop'),
+      },
+      {
+        id: '102',
+        author: people.bob,
+        created: '2026-11-16T11:00:00.000+0000',
+        body: adf('Thanks'),
+      },
+    ];
+    const { tracker } = trackerWith((url) =>
+      url.pathname === '/rest/api/3/myself'
+        ? response(200, people.me)
+        : response(200, { comments, total: 3, maxResults: 100 }),
+    );
+    const after = await tracker.newComments('A-1', {
+      afterId: '99',
+      since: '2026-01-01T00:00:00Z',
+    });
+    expect(after.map((comment) => [comment.id, comment.body])).toEqual([
+      ['101', '/agent stop'],
+      ['102', 'Thanks'],
+    ]);
+    const since = await tracker.newComments('A-1', { since: '2026-11-16T10:30:00Z' });
+    expect(since.map((comment) => comment.id)).toEqual(['102']);
+  });
+
+  it('looks up groups and users for the allow-list', async () => {
+    const { tracker } = trackerWith((url) =>
+      url.pathname === '/rest/api/3/user/groups'
+        ? response(200, [{ name: 'tech-leads' }, { name: 'jira-users' }])
+        : response(200, [{ ...people.maria, emailAddress: 'maria@acme.com' }]),
+    );
+    expect(await tracker.userGroups('acc-maria')).toEqual(['tech-leads', 'jira-users']);
+    expect(await tracker.findUsers('maria@acme.com')).toEqual([
+      { ...people.maria, email: 'maria@acme.com' },
+    ]);
+  });
+});

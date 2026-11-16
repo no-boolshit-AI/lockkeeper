@@ -15,6 +15,14 @@ export interface SnapshotInput {
   now?: Date;
 }
 
+/**
+ * Lockkeeper's own status comments. Other comments by the same account still count: a
+ * person trying Lockkeeper with their own token still writes tickets and commands.
+ */
+export function isOwnStatusComment(authorId: string, body: string, self?: Person): boolean {
+  return self !== undefined && authorId === self.accountId && /\bLockkeeper\b/.test(body);
+}
+
 export function toPerson(user: JiraUser | null | undefined): Person | undefined {
   if (!user?.accountId) return undefined;
   const person: Person = {
@@ -70,16 +78,9 @@ export function buildSnapshot(input: SnapshotInput): TicketSnapshot {
       created: comment.created,
       body: adfToMarkdown(comment.body, stats),
     }))
-    // Leave out Lockkeeper's own status comments, but not other comments by the same
-    // account: a person trying Lockkeeper with their own token still writes tickets.
     .filter(
       (comment) =>
-        comment.body !== '' &&
-        !(
-          self &&
-          comment.author.accountId === self.accountId &&
-          /\bLockkeeper\b/.test(comment.body)
-        ),
+        comment.body !== '' && !isOwnStatusComment(comment.author.accountId, comment.body, self),
     );
 
   const externalAuthors = new Map<string, Person>();

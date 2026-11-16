@@ -16,7 +16,7 @@ import {
   testConfig,
   ticketFixture,
 } from '../support/fakes.js';
-import { LocalSandboxProvider, makeBinDir } from '../support/local-sandbox.js';
+import { LocalSandboxProvider, makeBinDir, waitForAgents } from '../support/local-sandbox.js';
 
 const MET = [
   { criterion: 'hello.txt exists', met: true, evidence: 'test -f hello.txt passes' },
@@ -467,11 +467,7 @@ describe('resuming after a restart', () => {
   afterEach(async () => {
     if (!h) return;
     // Let a detached fake agent finish before its folder is removed.
-    const home = h.sandboxes.sandboxes[0]?.homeDir;
-    if (home) {
-      const exit = join(home, '.lockkeeper', 'agent-0', 'exit_code');
-      await waitFor(() => existsSync(exit)).catch(() => undefined);
-    }
+    await waitForAgents(h.sandboxes.sandboxes);
     h.store.close();
     rmSync(h.root, { recursive: true, force: true });
     h = undefined;

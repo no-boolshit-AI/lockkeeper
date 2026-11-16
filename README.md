@@ -89,11 +89,22 @@ lockkeeper run SHOP-123
 
 Then `lockkeeper runs` lists runs, and `lockkeeper runs <id>` shows a run's audit log: the snapshot, prompts, every command the agent ran, the checks, the policy findings, the commit and the cost. `lockkeeper cancel SHOP-123` releases a ticket and deletes its sandbox.
 
+**6. Start the service.** It polls Jira, so nothing has to reach your machine from outside.
+
+```bash
+lockkeeper start
+```
+
+Now adding the `agent` label to a ticket starts a run within a minute. Lockkeeper checks the ticket's history to see who added the label. Only people on `jira.allow_users` count, by email, account ID or group. With an empty list, anyone in your Jira organisation does. Apps and customer accounts never do.
+
+From the ticket, people can stop a run by removing its label or by commenting `/agent stop`. Stopping the service with Ctrl-C pauses runs in progress, and `lockkeeper start` picks them up where they stopped.
+
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `lockkeeper run <ticket> [--dry-run]` | Run one ticket end to end |
+| `lockkeeper start` | Watch Jira and run labelled tickets until stopped |
+| `lockkeeper run <ticket> [--dry-run]` | Run one ticket end to end, or continue its run if the process running it stopped |
 | `lockkeeper check [--live]` | Validate the config and credentials; with `--live`, call Jira, GitHub and E2B |
 | `lockkeeper secrets sync` | Store the model key as an E2B secret so it never enters a sandbox |
 | `lockkeeper runs [id]` | List runs, or show one run's audit log |
@@ -113,7 +124,8 @@ npm run check
 
 | Folder | Holds |
 | --- | --- |
-| `src/engine` | The run: orchestration, prompts, sandbox steps, report templates |
+| `src/daemon` | `lockkeeper start`: polling, claiming tickets, stopping and resuming runs |
+| `src/engine` | The run: orchestration, prompts, sandbox steps, report templates, the allow-list |
 | `src/tracker` | The `Tracker` interface and the Jira Cloud client (ADF, snapshots) |
 | `src/scm` | The `SourceControl` interface and the GitHub App implementation |
 | `src/sandbox` | The `Sandbox` interface and the E2B provider |

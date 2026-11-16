@@ -11,9 +11,10 @@ Notes for anyone, person or coding agent, changing this repository. The product 
 
 ## Layout
 
-- `src/engine/run.ts` drives a run from claim to report. Sandbox steps live in `workspace.ts`, prompts in `prompts.ts`, and posted text in `report.ts`.
+- `src/engine/run.ts` drives a run from claim to report as a resumable state machine: each phase records what it did, so a run continues after a restart. Sandbox steps live in `workspace.ts`, prompts in `prompts.ts`, and posted text in `report.ts`.
+- `src/daemon/daemon.ts` is `lockkeeper start`: it polls Jira, checks who added the label (`src/engine/authorize.ts`), claims each ticket once, queues runs beyond the parallel cap, acts on `/agent` comments (`src/engine/commands.ts`) and resumes interrupted runs.
 - Four interfaces keep the product swappable: `Tracker` (src/tracker), `SourceControl` (src/scm), `SandboxProvider` (src/sandbox) and `AgentAdapter` (src/agent). Jira, GitHub, E2B and Claude Code calls never appear outside their implementations.
-- Tests live in `test/`, mirroring `src/`. `test/engine/run.test.ts` runs the whole loop with real git, a test-only local sandbox and a fake `claude` (`test/support`).
+- Tests live in `test/`, mirroring `src/`. `test/engine/run.test.ts` runs the whole loop with real git, a test-only local sandbox and a fake `claude` (`test/support`). `test/daemon/daemon.test.ts` drives the service against an in-memory Jira (`test/support/fake-jira.ts`).
 
 ## Rules that protect the security model
 

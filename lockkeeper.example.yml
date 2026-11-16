@@ -13,8 +13,11 @@ jira:
     needs_info: agent-needs-info
     in_review: agent-in-review
     failed: agent-failed
-  # Who may trigger runs (used by the label trigger in M2): emails, account IDs or groups.
+  # Who may start or stop runs: emails, account IDs or group names. Empty means anyone
+  # in your Jira organisation. Apps and customer accounts are never allowed.
   allow_users: [maria@acme.com, tech-leads]
+  # How often `lockkeeper start` checks Jira.
+  poll_seconds: 30
   # Tickets with text from external (customer) accounts are refused unless allowed.
   allow_external: false
   # A custom field holding acceptance criteria. Detected by name when unset.

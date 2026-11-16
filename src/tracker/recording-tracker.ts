@@ -1,5 +1,17 @@
 import type { Doc } from '../core/doc.js';
-import type { LabelChange, Person, TicketSnapshot, Tracker } from './tracker.js';
+import type {
+  LabelChange,
+  LabelEvent,
+  Person,
+  TicketComment,
+  TicketRef,
+  TicketSnapshot,
+  Tracker,
+} from './tracker.js';
+
+/** The reads a recording tracker passes through. Only the first four are required. */
+export type TrackerReads = Pick<Tracker, 'kind' | 'whoami' | 'snapshot' | 'ticketUrl'> &
+  Partial<Pick<Tracker, 'search' | 'labelAdded' | 'newComments' | 'userGroups' | 'findUsers'>>;
 
 export type TrackerWrite =
   | { action: 'postComment'; key: string; commentId: string; body: Doc }
@@ -17,7 +29,7 @@ export class RecordingTracker implements Tracker {
   readonly writes: TrackerWrite[] = [];
   private counter = 0;
 
-  constructor(private readonly inner: Pick<Tracker, 'kind' | 'whoami' | 'snapshot' | 'ticketUrl'>) {
+  constructor(private readonly inner: TrackerReads) {
     this.kind = inner.kind;
   }
 
@@ -27,6 +39,34 @@ export class RecordingTracker implements Tracker {
 
   snapshot(key: string): Promise<TicketSnapshot> {
     return this.inner.snapshot(key);
+  }
+
+  search(query: string, limit?: number): Promise<TicketRef[]> {
+    return this.read('search').call(this.inner, query, limit);
+  }
+
+  labelAdded(key: string, label: string): Promise<LabelEvent | undefined> {
+    return this.read('labelAdded').call(this.inner, key, label);
+  }
+
+  newComments(key: string, after: { afterId?: string; since: string }): Promise<TicketComment[]> {
+    return this.read('newComments').call(this.inner, key, after);
+  }
+
+  userGroups(accountId: string): Promise<string[]> {
+    return this.read('userGroups').call(this.inner, accountId);
+  }
+
+  findUsers(query: string): Promise<Person[]> {
+    return this.read('findUsers').call(this.inner, query);
+  }
+
+  private read<K extends 'search' | 'labelAdded' | 'newComments' | 'userGroups' | 'findUsers'>(
+    name: K,
+  ): NonNullable<TrackerReads[K]> {
+    const method = this.inner[name];
+    if (!method) throw new Error(`The tracker behind this recording cannot ${name}.`);
+    return method as NonNullable<TrackerReads[K]>;
   }
 
   async postComment(key: string, body: Doc): Promise<string> {

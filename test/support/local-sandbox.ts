@@ -1,5 +1,13 @@
 import { spawn } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type {
@@ -139,4 +147,35 @@ export function makeBinDir(root: string): string {
   );
   script('claude', `#!/bin/sh\nexec node ${JSON.stringify(join(here, 'fake-claude.mjs'))} "$@"\n`);
   return bin;
+}
+
+/** Whether a fake agent started in this sandbox home is still running. */
+function agentsRunning(home: string): boolean {
+  const work = join(home, '.lockkeeper');
+  if (!existsSync(work)) return false;
+  for (const dir of readdirSync(work)) {
+    const pidFile = join(work, dir, 'session.pid');
+    if (!existsSync(pidFile) || existsSync(join(work, dir, 'exit_code'))) continue;
+    const pid = Number(readFileSync(pidFile, 'utf8').trim());
+    try {
+      // Signal 0 only checks that the process exists. A killed agent never writes exit_code.
+      if (pid > 0) process.kill(pid, 0);
+      return true;
+    } catch {
+      // Gone.
+    }
+  }
+  return false;
+}
+
+/** Wait until no fake agent in these sandboxes is running, so their folders can go. */
+export async function waitForAgents(
+  sandboxes: readonly LocalSandbox[],
+  timeoutMs = 8_000,
+): Promise<void> {
+  const started = Date.now();
+  while (sandboxes.some((sandbox) => agentsRunning(sandbox.homeDir))) {
+    if (Date.now() - started > timeoutMs) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
 }

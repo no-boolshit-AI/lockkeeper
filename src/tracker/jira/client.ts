@@ -61,6 +61,25 @@ export interface JiraTransition {
   to?: { name?: string };
 }
 
+export interface JiraSearchIssue {
+  key: string;
+  fields: { labels?: string[]; updated?: string; creator?: JiraUser | null; created?: string };
+}
+
+export interface JiraChangeItem {
+  field?: string;
+  fieldId?: string;
+  fromString?: string | null;
+  toString?: string | null;
+}
+
+export interface JiraHistory {
+  id: string;
+  author?: JiraUser;
+  created: string;
+  items: JiraChangeItem[];
+}
+
 export interface JiraClientOptions {
   /** Host name, such as acme.atlassian.net. */
   site: string;
@@ -229,6 +248,61 @@ export class JiraClient {
 
   async addRemoteLink(key: string, body: unknown): Promise<void> {
     await this.request('POST', `/rest/api/3/issue/${encodeURIComponent(key)}/remotelink`, { body });
+  }
+
+  /** JQL search through the enhanced search API, following its page tokens. */
+  async search(jql: string, fields: string[], limit: number): Promise<JiraSearchIssue[]> {
+    const issues: JiraSearchIssue[] = [];
+    let nextPageToken: string | undefined;
+    do {
+      const page = await this.request<{ issues?: JiraSearchIssue[]; nextPageToken?: string }>(
+        'POST',
+        '/rest/api/3/search/jql',
+        {
+          body: {
+            jql,
+            fields,
+            maxResults: Math.min(100, limit - issues.length),
+            ...(nextPageToken ? { nextPageToken } : {}),
+          },
+        },
+      );
+      issues.push(...(page.issues ?? []));
+      nextPageToken = page.nextPageToken;
+    } while (nextPageToken && issues.length < limit);
+    return issues;
+  }
+
+  /** The issue's full change history, oldest first. */
+  async getChangelog(key: string): Promise<JiraHistory[]> {
+    const histories: JiraHistory[] = [];
+    for (let startAt = 0; ; ) {
+      const page = await this.request<{ values: JiraHistory[]; total?: number; isLast?: boolean }>(
+        'GET',
+        `/rest/api/3/issue/${encodeURIComponent(key)}/changelog`,
+        { query: { startAt, maxResults: 100 } },
+      );
+      histories.push(...page.values);
+      startAt += page.values.length;
+      if (page.values.length === 0 || page.isLast || startAt >= (page.total ?? 0)) return histories;
+    }
+  }
+
+  getIssueFields(key: string, fields: string[]): Promise<JiraSearchIssue> {
+    return this.request('GET', `/rest/api/3/issue/${encodeURIComponent(key)}`, {
+      query: { fields: fields.join(',') },
+    });
+  }
+
+  async userGroups(accountId: string): Promise<string[]> {
+    const groups = await this.request<{ name?: string }[]>('GET', '/rest/api/3/user/groups', {
+      query: { accountId },
+    });
+    return groups.map((group) => group.name ?? '').filter(Boolean);
+  }
+
+  searchUsers(query: string): Promise<JiraUser[]> {
+    return this.request('GET', '/rest/api/3/user/search', { query: { query, maxResults: 10 } });
   }
 
   async getTransitions(key: string): Promise<JiraTransition[]> {

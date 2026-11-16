@@ -149,6 +149,26 @@ const IMPLEMENTED: ReadonlySet<RunState> = new Set(['collect', 'publish', 'repor
 /** Thrown inside a run to stop without reporting, leaving it for a later process. */
 class RunDetachedError extends Error {}
 
+/** How a run was started, kept as JSON on the run (O2: who triggered it). */
+export interface TriggerInfo {
+  source: 'label' | 'cli' | 'retry' | 'answers';
+  by?: { accountId: string; displayName: string };
+  label?: string;
+  /** The label change that started the run, so it is never acted on twice. */
+  eventId?: string;
+  at?: string;
+}
+
+export function parseTriggerInfo(value: string | null | undefined): TriggerInfo | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed = JSON.parse(value) as TriggerInfo;
+    return typeof parsed === 'object' && parsed !== null ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 interface PromptRecord {
   round: number;
   system?: string;
@@ -280,7 +300,7 @@ export async function resumeRun(
   const nowMs = (deps.now ?? Date.now)();
   const now = new Date(nowMs);
   const run = deps.store.getRun(runId);
-  if (!run || !isExecuting(run.state)) return undefined;
+  if (!run || !(isExecuting(run.state) || run.state === 'queued')) return undefined;
   if (!deps.store.acquireLease(run.id, PROCESS_OWNER, leaseEnd(nowMs), now)) return undefined;
   let settings: ProjectSettings;
   try {
@@ -1224,11 +1244,13 @@ class TicketRun {
   }
 
   private async refuse(reason: string, hint?: string): Promise<RunResult> {
-    const ticket = this.ticket as TicketSnapshot;
+    const key = this.run.ticketKey;
     this.audit('refused', { reason });
     this.log.warn(`Refused: ${reason}`);
     try {
-      await this.tracker.postComment(this.run.ticketKey, refusedDoc({ ticket }, reason, hint));
+      await this.tracker.postComment(key, refusedDoc(key, reason, hint));
+      // Clear the label, so the ticket shows plainly that nothing is running.
+      await this.tracker.updateLabels(key, { remove: [this.deps.config.jira.labels.trigger] });
     } catch (error) {
       this.log.warn(`Could not comment on ${this.run.ticketKey}: ${(error as Error).message}`);
     }
@@ -1324,6 +1346,7 @@ class TicketRun {
   // -------------------------------------------------------------------------
 
   private context(): RunContext {
+    const by = parseTriggerInfo(this.run.triggerInfo)?.by;
     return {
       ticket: this.ticket as TicketSnapshot,
       runId: this.run.id,
@@ -1332,6 +1355,7 @@ class TicketRun {
         costUsd: this.deps.config.limits.cost_usd,
         minutes: this.deps.config.limits.minutes,
       },
+      ...(by ? { requester: { accountId: by.accountId, displayName: by.displayName } } : {}),
     };
   }
 

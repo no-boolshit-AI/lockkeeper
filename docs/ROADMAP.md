@@ -10,7 +10,7 @@ Dates assume work started on 16 November 2026 with one or two engineers, as the 
 | --- | --- | --- | --- | --- | --- |
 | M0 Foundation | (none) | 17 Nov 2026 | Repository, toolchain, CI, licence, the four extension interfaces, config schema | CI green on `main` | Done |
 | M1 Walking skeleton | Weeks 1-2 | 29 Nov 2026 | `lockkeeper run PROJ-1` turns a ticket into a draft PR and a Jira comment, using Claude Code in an E2B sandbox | A demo ticket becomes a draft PR in under 15 minutes | Exit gate met on 16 Nov 2026 |
-| M2 Private alpha | Weeks 3-6 | 27 Dec 2026 | Label trigger, readiness check, caps, verification, `init` and `doctor`, with three to five design partners | 20 real tickets across 3 teams, at least half merged | Not started |
+| M2 Private alpha | Weeks 3-6 | 27 Dec 2026 | Label trigger, readiness check, caps, verification, `init` and `doctor`, with three to five design partners | 20 real tickets across 3 teams, at least half merged | In progress |
 | M3 Public beta | Weeks 7-10 | 24 Jan 2027 | Review follow-ups, pause and resume, Codex CLI and OpenCode adapters, `demo`, run page, Docker image, security docs | Five fresh installs each reach a first PR in under 15 minutes | Not started |
 | M4 1.0 | Weeks 11-14 | 21 Feb 2027 | Hardening, evaluation suite, upgrade path, contribution guide | No open critical security finding, and the merge-rate target met at design partners | Not started |
 
@@ -74,20 +74,20 @@ Known gaps to close in M2:
 
 Goal: a team labels tickets and gets PRs or questions back without anyone running commands.
 
-| Workstream | Requirements |
-| --- | --- |
-| Poll the JQL filter. Read the changelog to see who added the label. Check user and project allow-lists. Claim each ticket exactly once across restarts | T1, T2, T6 |
-| Component and label overrides for the repository; ask when it cannot be resolved | T5 |
-| Run engine as a persistent state machine that resumes after a restart; parallel-run cap per install | E7, O2 |
-| Read-only readiness pass with its own small cap; numbered questions that mention the requester; `/agent go` resumes with the answers | R1, R2 |
-| Workflow override by label; the bugfix workflow proves a failing test first | E5 |
-| Environment order: `lockkeeper.yml`, then the dev container, then `AGENTS.md`, then detection | E6 |
-| Up to two fix rounds when verification fails. Diff-size and fix-round caps named on the ticket | V1, E7 |
-| Acceptance-criteria evidence table. A criterion without evidence is listed as unmet and keeps the PR a draft | V4 |
-| Final result comment, optional status transition | J1, J2 |
-| `/agent stop`, removing the label, and `/agent retry` with a hint | F3 |
-| `init`: GitHub App through the manifest flow, Jira and E2B checks, config written. `doctor`: credentials, sandbox boot, clone, setup, tests, network policy, secret injection, branch rules | O1 |
-| Full audit trail: who triggered the run, blocked requests, cost | O2 |
+| Workstream | Requirements | Status |
+| --- | --- | --- |
+| Poll the JQL filter. Read the changelog to see who added the label. Check user and project allow-lists. Claim each ticket exactly once across restarts | T1, T2, T6 | Done: `lockkeeper start` |
+| Component and label overrides for the repository; ask when it cannot be resolved | T5 | Done in M1 |
+| Run engine as a persistent state machine that resumes after a restart; parallel-run cap per install | E7, O2 | Done: runs reattach to a working agent and never publish twice |
+| Read-only readiness pass with its own small cap; numbered questions that mention the requester; `/agent go` resumes with the answers | R1, R2 | Not started |
+| Workflow override by label; the bugfix workflow proves a failing test first | E5 | Override done in M1; proof not started |
+| Environment order: `lockkeeper.yml`, then the dev container, then `AGENTS.md`, then detection | E6 | `lockkeeper.yml` and detection only |
+| Up to two fix rounds when verification fails. Diff-size and fix-round caps named on the ticket | V1, E7 | Done in M1 |
+| Acceptance-criteria evidence table. A criterion without evidence is listed as unmet and keeps the PR a draft | V4 | Done in M1 |
+| Final result comment, optional status transition | J1, J2 | Done in M1; the final comment now mentions whoever added the label |
+| `/agent stop`, removing the label, and `/agent retry` with a hint | F3 | Stop done; retry not started |
+| `init`: GitHub App through the manifest flow, Jira and E2B checks, config written. `doctor`: credentials, sandbox boot, clone, setup, tests, network policy, secret injection, branch rules | O1 | Not started |
+| Full audit trail: who triggered the run, blocked requests, cost | O2 | Trigger and cost done; blocked requests not started |
 
 Exit gate: 20 real tickets across 3 design-partner teams, at least half merged.
 
