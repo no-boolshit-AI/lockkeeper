@@ -91,8 +91,20 @@ Goal: a team labels tickets and gets PRs or questions back without anyone runnin
 
 Exit gate: 20 real tickets across 3 design-partner teams, at least half merged.
 
-Build status on 16 November 2026: every M2 workstream is built and tested (144 tests, plus a live `doctor` run). Not yet done: a live run of `lockkeeper start` on real tickets, and the design partners. Notes for later:
+Build status on 16 November 2026: every M2 workstream is built and tested (150 tests), and `lockkeeper doctor` passed against the live demo setup. Still to come: the design partners.
 
+Live run of `lockkeeper start`, 16 November 2026, on three new tickets in a real Jira Cloud project, for about $0.45 of model usage:
+
+- A bug ticket, labelled when it was created, passed the readiness check and became a ready PR. Lockkeeper confirmed the new test failed without the fix.
+- A vague ticket got five sensible numbered questions. `/agent go` with the answers continued it to a PR, and `/agent retry` later added a second commit to that PR.
+- On a third ticket, a Ctrl-C paused a run mid-agent. The next start reattached to the agent in its paused sandbox, and `/agent stop` then ended the run within seconds. A final `/agent retry` added to the ticket's existing PR.
+- Afterwards, the only sandboxes left were the four parked for PRs in review.
+
+It found three bugs, all fixed with regression tests. The service stopped a run that was swapping its own labels at the end of its report. A retry after a stopped retry would have opened a second PR. Bold text in PR bodies could show its asterisks.
+
+Notes for later:
+
+- A run stopped mid-agent reports no cost, because Claude Code reports cost only when it finishes.
 - The readiness check and the implementation use separate agent sessions, so the implementation reads the code again. Continuing the check's session would save time and tokens.
 - The time limit counts from a run's first start, including time Lockkeeper was stopped. Waiting for answers resets it.
 - A run waiting for answers holds no sandbox. `/agent go` starts a fresh one.

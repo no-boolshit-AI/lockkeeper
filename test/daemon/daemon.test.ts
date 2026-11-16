@@ -225,10 +225,29 @@ describe('the daemon', () => {
     await waitFor(() => Boolean(h?.agentStarted('DEMO-1')));
 
     h.jira.removeLabel('DEMO-1', 'agent-working');
+    // One poll without the label could be the run's own label swap or a lagging search.
+    await h.daemon.tick();
+    expect(h.runFor('DEMO-1')?.state).toBe('implement');
     await h.daemon.tick();
     await h.daemon.settle();
     expect(h.runFor('DEMO-1')?.state).toBe('cancelled');
     expect(h.jira.texts('DEMO-1')[0]).toContain('label was removed');
+  });
+
+  it('does not stop a run when its label is missing for just one poll', async () => {
+    // From the live test: a run swaps agent-working for agent-in-review as it finishes.
+    h = harness({ sleepMs: 2_000 });
+    h.jira.addIssue('DEMO-1');
+    h.jira.addLabel('DEMO-1', 'agent', maria);
+    await h.daemon.tick();
+    await waitFor(() => Boolean(h?.agentStarted('DEMO-1')));
+    h.jira.removeLabel('DEMO-1', 'agent-working');
+    await h.daemon.tick();
+    h.jira.addLabel('DEMO-1', 'agent-in-review', maria);
+    await h.daemon.tick();
+    await h.daemon.settle();
+    expect(h.runFor('DEMO-1')?.state).toBe('in_review');
+    expect(h.scm.pullRequests).toHaveLength(1);
   });
 
   it('stops a queued run before it starts', async () => {
@@ -333,8 +352,42 @@ describe('the daemon', () => {
 
     h.jira.removeLabel('DEMO-1', 'agent-needs-info');
     await h.daemon.tick();
+    await h.daemon.tick();
     expect(h.runFor('DEMO-1')?.state).toBe('cancelled');
     expect(h.jira.texts('DEMO-1')[0]).toContain('agent-needs-info label was removed');
+  });
+
+  it('continues the published pull request after a retry that was stopped', async () => {
+    h = harness();
+    h.jira.addIssue('DEMO-1');
+    h.jira.addLabel('DEMO-1', 'agent', maria);
+    await h.daemon.tick();
+    await h.daemon.settle();
+    const first = h.runFor('DEMO-1');
+
+    // A retry that is stopped before it commits.
+    const slow = { writes: { 'hello.txt': 'hello there\n' }, text: REPORT, sleepMs: 5_000 };
+    writeFileSync(join(h.root, 'agent-script.json'), JSON.stringify({ rounds: [slow] }));
+    h.jira.comment('DEMO-1', maria, '/agent retry Say more.');
+    await h.daemon.tick();
+    await waitFor(
+      () => Boolean(h?.agentStarted('DEMO-1')) && h?.runFor('DEMO-1')?.id !== first?.id,
+    );
+    h.jira.comment('DEMO-1', maria, '/agent stop');
+    await h.daemon.tick();
+    await h.daemon.settle();
+    expect(h.runFor('DEMO-1')?.state).toBe('cancelled');
+
+    // The next retry still adds to the first run's branch and pull request.
+    const again = { writes: { 'hello.txt': 'hello again\n' }, text: REPORT };
+    writeFileSync(join(h.root, 'agent-script.json'), JSON.stringify({ rounds: [again] }));
+    h.jira.comment('DEMO-1', maria, '/agent retry Try again.');
+    await h.daemon.tick();
+    await h.daemon.settle();
+    const last = h.runFor('DEMO-1');
+    expect(last).toMatchObject({ state: 'in_review', branch: first?.branch });
+    expect(h.scm.pullRequests).toHaveLength(1);
+    expect(h.scm.commits.map((commit) => commit.createBranch)).toEqual([true, false]);
   });
 
   it('resumes the runs a previous process left, and leaves its own to resume', async () => {

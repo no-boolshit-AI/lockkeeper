@@ -131,3 +131,15 @@ describe('hidden text', () => {
     expect(isHiddenColor('#ff5630')).toBe(false);
   });
 });
+
+describe('Markdown emphasis', () => {
+  it('keeps spaces outside bold and italic markers, as CommonMark requires', () => {
+    // From the live test: "**Failing test first: **" showed its asterisks on GitHub.
+    expect(docToMarkdown([paragraph(bold('Failing test first: '), 'without the fix')])).toBe(
+      '**Failing test first:** without the fix\n',
+    );
+    expect(docToMarkdown([paragraph('a', { kind: 'text', text: ' b ', italic: true }, 'c')])).toBe(
+      'a _b_ c\n',
+    );
+  });
+});

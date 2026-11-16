@@ -54,6 +54,8 @@ export class Daemon {
   private readonly lastError = new Map<string, string>();
   private stopping = false;
   private lastRetryScan: number | undefined;
+  /** Runs whose ticket had none of Lockkeeper's labels at the last poll. */
+  private readonly unlabelled = new Set<string>();
   private wake: (() => void) | undefined;
 
   constructor(
@@ -240,12 +242,17 @@ export class Daemon {
     for (const run of runs) {
       if (this.stopping) return;
       const ticketLabels = current.get(run.ticketKey);
+      const ours = [labels.trigger, labels.working, labels.needs_info, labels.in_review];
       const labelled =
-        ticketLabels === undefined ||
-        ticketLabels.includes(labels.working) ||
-        ticketLabels.includes(labels.trigger) ||
-        (run.state === 'needs_info' && ticketLabels.includes(labels.needs_info));
-      if (!labelled) {
+        ticketLabels === undefined || ticketLabels.some((label) => ours.includes(label));
+      // A run swaps its own labels as it finishes, and Jira's search can lag behind: only
+      // a label missing on two polls in a row stops a run, and never while it publishes.
+      if (labelled || run.state === 'publish' || run.state === 'report') {
+        this.unlabelled.delete(run.id);
+      } else if (!this.unlabelled.has(run.id)) {
+        this.unlabelled.add(run.id);
+      } else {
+        this.unlabelled.delete(run.id);
         const removed = run.state === 'needs_info' ? labels.needs_info : labels.working;
         await this.stopRun(run, `The ${removed} label was removed, so Lockkeeper stopped.`);
         continue;
@@ -351,8 +358,12 @@ export class Daemon {
         }
       }
     }
-    // A run that published continues on its branch; anything else starts afresh.
-    const branch = previous.headSha && previous.branch ? previous.branch : null;
+    // The ticket's latest run that published continues on its branch, even when a retry
+    // since then was stopped before it committed. Otherwise the attempt starts afresh.
+    const published = store
+      .listRuns({ ticketKey: previous.ticketKey, limit: 20 })
+      .find((run) => run.headSha && run.branch);
+    const branch = published?.branch ?? null;
     const trigger: TriggerInfo = {
       source: 'retry',
       at: comment.created,

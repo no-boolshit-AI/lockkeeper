@@ -102,8 +102,16 @@ function inlineToMarkdown(inline: Inline): string {
         out = `${fence}${pad}${inline.text.replace(/\r?\n/g, ' ')}${pad}${fence}`;
       } else {
         out = escapeMarkdown(inline.text);
-        if (inline.bold) out = `**${out}**`;
-        if (inline.italic) out = `_${out}_`;
+        // `**text **` is not bold in CommonMark: keep outer spaces outside the markers.
+        const core = out.trim();
+        if (core && (inline.bold || inline.italic)) {
+          const lead = out.slice(0, out.indexOf(core));
+          const trail = out.slice(lead.length + core.length);
+          let marked = core;
+          if (inline.bold) marked = `**${marked}**`;
+          if (inline.italic) marked = `_${marked}_`;
+          out = `${lead}${marked}${trail}`;
+        }
       }
       if (inline.href && isSafeHref(inline.href)) out = `[${out}](<${inline.href}>)`;
       return out;
