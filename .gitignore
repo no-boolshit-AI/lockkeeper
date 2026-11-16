@@ -1,0 +1,15 @@
+node_modules/
+dist/
+coverage/
+*.log
+.DS_Store
+
+# Local state: SQLite store, secrets, GitHub App key
+.lockkeeper/
+.env
+.env.*
+!.env.example
+*.pem
+
+# A real config usually names internal sites and users; commit the example instead
+/lockkeeper.yml

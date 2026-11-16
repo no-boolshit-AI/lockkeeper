@@ -1,0 +1,59 @@
+{
+  "name": "lockkeeper",
+  "version": "0.1.0-alpha.0",
+  "description": "Turns a labelled Jira ticket into a reviewable GitHub pull request, using the coding agent of your choice inside a sealed E2B sandbox.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "lockkeeper": "dist/cli/main.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "lockkeeper.example.yml"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/no-boolshit-AI/lockkeeper.git"
+  },
+  "homepage": "https://github.com/no-boolshit-AI/lockkeeper#readme",
+  "bugs": "https://github.com/no-boolshit-AI/lockkeeper/issues",
+  "keywords": [
+    "jira",
+    "github",
+    "e2b",
+    "coding-agent",
+    "claude-code",
+    "pull-request",
+    "sandbox"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsx src/cli/main.ts",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm run lint && npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "@octokit/auth-app": "8.3.1",
+    "@octokit/rest": "22.0.1",
+    "commander": "15.1.0",
+    "e2b": "2.64.0",
+    "yaml": "2.9.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.6.8",
+    "@types/node": "22.20.5",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vitest": "5.1.0"
+  }
+}
