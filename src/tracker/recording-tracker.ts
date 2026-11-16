@@ -7,11 +7,17 @@ import type {
   TicketRef,
   TicketSnapshot,
   Tracker,
+  TrackerAbility,
 } from './tracker.js';
 
 /** The reads a recording tracker passes through. Only the first four are required. */
 export type TrackerReads = Pick<Tracker, 'kind' | 'whoami' | 'snapshot' | 'ticketUrl'> &
-  Partial<Pick<Tracker, 'search' | 'labelAdded' | 'newComments' | 'userGroups' | 'findUsers'>>;
+  Partial<
+    Pick<
+      Tracker,
+      'search' | 'labelAdded' | 'newComments' | 'userGroups' | 'findUsers' | 'missingAbilities'
+    >
+  >;
 
 export type TrackerWrite =
   | { action: 'postComment'; key: string; commentId: string; body: Doc }
@@ -61,9 +67,19 @@ export class RecordingTracker implements Tracker {
     return this.read('findUsers').call(this.inner, query);
   }
 
-  private read<K extends 'search' | 'labelAdded' | 'newComments' | 'userGroups' | 'findUsers'>(
-    name: K,
-  ): NonNullable<TrackerReads[K]> {
+  missingAbilities(project: string, abilities: TrackerAbility[]): Promise<TrackerAbility[]> {
+    return this.read('missingAbilities').call(this.inner, project, abilities);
+  }
+
+  private read<
+    K extends
+      | 'search'
+      | 'labelAdded'
+      | 'newComments'
+      | 'userGroups'
+      | 'findUsers'
+      | 'missingAbilities',
+  >(name: K): NonNullable<TrackerReads[K]> {
     const method = this.inner[name];
     if (!method) throw new Error(`The tracker behind this recording cannot ${name}.`);
     return method as NonNullable<TrackerReads[K]>;

@@ -294,6 +294,15 @@ export class JiraClient {
     });
   }
 
+  async listProjects(): Promise<{ key: string; name: string }[]> {
+    const page = await this.request<{ values?: { key: string; name: string }[] }>(
+      'GET',
+      '/rest/api/3/project/search',
+      { query: { maxResults: 100, orderBy: 'name' } },
+    );
+    return (page.values ?? []).map(({ key, name }) => ({ key, name }));
+  }
+
   async userGroups(accountId: string): Promise<string[]> {
     const groups = await this.request<{ name?: string }[]>('GET', '/rest/api/3/user/groups', {
       query: { accountId },

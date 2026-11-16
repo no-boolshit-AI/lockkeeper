@@ -4,6 +4,7 @@ import { LockkeeperError } from '../../core/errors.js';
 import {
   type BaseRef,
   type BranchHead,
+  type BranchRule,
   type CloneAccess,
   type CommitInput,
   type CommitResult,
@@ -169,6 +170,38 @@ export class GitHubSourceControl implements SourceControl {
       if (statusOf(error) === 404) return false;
       throw error;
     }
+  }
+
+  async missingPermissions(repo: string): Promise<string[]> {
+    const { owner, name } = parseRepo(repo);
+    await this.installationId(repo);
+    const { data } = await this.appClient.rest.apps.getRepoInstallation({ owner, repo: name });
+    const granted = (data.permissions ?? {}) as Record<string, string | undefined>;
+    const needed: Record<string, 'read' | 'write'> = {
+      metadata: 'read',
+      contents: 'write',
+      pull_requests: 'write',
+    };
+    return Object.entries(needed)
+      .filter(([permission, level]) => {
+        const has = granted[permission];
+        return level === 'write' ? has !== 'write' && has !== 'admin' : has === undefined;
+      })
+      .map(([permission, level]) => `${permission}: ${level}`);
+  }
+
+  async branchRules(repo: string, branch: string): Promise<BranchRule[]> {
+    const { owner, name } = parseRepo(repo);
+    const client = await this.client(repo);
+    const { data } = await client.request('GET /repos/{owner}/{repo}/rules/branches/{branch}', {
+      owner,
+      repo: name,
+      branch,
+    });
+    return (data as { type: string; ruleset_id?: number }[]).map((rule) => ({
+      type: rule.type,
+      ...(rule.ruleset_id ? { rulesetId: rule.ruleset_id } : {}),
+    }));
   }
 
   async branchHead(repo: string, branch: string): Promise<BranchHead | undefined> {

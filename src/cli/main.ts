@@ -8,7 +8,11 @@ import { ENV } from '../config/secrets.js';
 import { LockkeeperError } from '../core/errors.js';
 import { consoleLogger } from '../core/log.js';
 import { Daemon } from '../daemon/daemon.js';
+import { type DoctorCheck, type DoctorDeps, runDoctor } from '../engine/doctor.js';
 import { type RunResult, runTicket } from '../engine/run.js';
+import { E2BProvider } from '../sandbox/e2b/e2b-provider.js';
+import { GitHubSourceControl } from '../scm/github/github-scm.js';
+import { JiraClient } from '../tracker/jira/client.js';
 import {
   buildRunDeps,
   loadContext,
@@ -17,7 +21,10 @@ import {
   makeScm,
   makeTracker,
   openStore,
+  resolveModelKey,
 } from './context.js';
+import { runInit } from './init.js';
+import { terminalIo } from './terminal-io.js';
 
 const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as {
   version: string;
@@ -262,6 +269,81 @@ async function liveChecks(context: ReturnType<typeof loadContext>): Promise<numb
     });
   }
   return problems;
+}
+
+program
+  .command('init')
+  .description('Set up Lockkeeper step by step: Jira, a GitHub App, E2B and the model key')
+  .option('--force', 'replace an existing lockkeeper.yml')
+  .action(async (options: { force?: boolean }) => {
+    await runInit(
+      terminalIo(),
+      {
+        jira: (site, email, token) => new JiraClient({ site, email, token }),
+        e2b: (apiKey) => new E2BProvider({ apiKey }),
+        github: (appId, privateKey) => new GitHubSourceControl({ appId, privateKey }),
+        fetch,
+      },
+      { dir: process.cwd(), ...(options.force ? { force: true } : {}) },
+    );
+  });
+
+program
+  .command('doctor')
+  .description(
+    'Check everything a run needs: credentials, permissions, a sandbox, the clone, setup, tests, the network policy and key injection',
+  )
+  .option('-p, --project <key>', 'check only this Jira project')
+  .action(async (options: { project?: string }) => {
+    const globals = program.opts<{ config?: string }>();
+    const context = loadContext(globals.config);
+    if (context.secrets.missing.length > 0) {
+      for (const missing of context.secrets.missing)
+        out(`✗ Missing ${missing.name}: ${missing.how}`);
+      process.exitCode = 1;
+      return;
+    }
+    const agent = makeAgent(context);
+    const sandboxes = makeE2B(context);
+    let modelKey: DoctorDeps['modelKey'];
+    try {
+      modelKey = await resolveModelKey(context, sandboxes, agent);
+    } catch (error) {
+      const hint = error instanceof LockkeeperError && error.hint ? { hint: error.hint } : {};
+      modelKey = { problem: (error as Error).message, ...hint };
+    }
+    out(
+      'Checking Lockkeeper. This starts a sandbox and runs setup and checks on the base branch.\n',
+    );
+    const checks = await runDoctor(
+      {
+        config: context.loaded.config,
+        tracker: makeTracker(context),
+        scm: makeScm(context),
+        sandboxes,
+        agent,
+        modelKey,
+      },
+      {
+        ...(options.project ? { projects: [options.project.toUpperCase()] } : {}),
+        onCheck: printCheck,
+      },
+    );
+    const failed = checks.filter((check) => check.status === 'fail').length;
+    const warned = checks.filter((check) => check.status === 'warn').length;
+    out(
+      failed + warned === 0
+        ? '\nEverything a run needs works.'
+        : `\n${failed} problem${failed === 1 ? '' : 's'}, ${warned} warning${warned === 1 ? '' : 's'}.`,
+    );
+    if (failed > 0) process.exitCode = 1;
+  });
+
+function printCheck(check: DoctorCheck): void {
+  const mark = { ok: '✓', warn: '!', fail: '✗', skip: '-' }[check.status];
+  out(`${mark} ${check.name}: ${check.detail}`);
+  if (check.fix) out(`  Fix: ${check.fix}`);
+  if (check.log) for (const line of check.log.split('\n')) out(`    ${line}`);
 }
 
 const secrets = program

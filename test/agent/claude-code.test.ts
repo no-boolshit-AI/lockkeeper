@@ -63,10 +63,11 @@ describe('the Claude Code adapter', () => {
     const [requirement] = adapter.requirements({ keyInEnvironment: true });
     expect(requirement?.check).toBe('command -v bwrap');
     expect(requirement?.hint).toContain('key_injection: egress');
-    expect(adapter.credential).toEqual({
+    expect(adapter.credential).toMatchObject({
       env: 'ANTHROPIC_API_KEY',
       host: 'api.anthropic.com',
       header: 'x-api-key',
+      probe: { url: 'https://api.anthropic.com/v1/models' },
     });
   });
 

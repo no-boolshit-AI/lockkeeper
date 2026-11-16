@@ -145,6 +145,18 @@ export class FakeScm implements SourceControl {
     return this.ref(branch) !== undefined;
   }
 
+  /** Set to make the App look under-permissioned or blocked by rules. */
+  missing: string[] = [];
+  rules: { type: string }[] = [];
+
+  async missingPermissions(): Promise<string[]> {
+    return this.missing;
+  }
+
+  async branchRules(): Promise<{ type: string }[]> {
+    return this.rules;
+  }
+
   async branchHead(_repo: string, branch: string): Promise<BranchHead | undefined> {
     const sha = this.ref(branch);
     return sha ? { sha, message: this.git(['log', '-1', '--format=%B', sha]) } : undefined;

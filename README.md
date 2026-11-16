@@ -4,7 +4,7 @@ Lockkeeper turns a labelled Jira ticket into a reviewable GitHub pull request. A
 
 It is for Jira Cloud teams that want agent delivery on their own terms: their keys, their choice of agent and model, per-project rules, and code they can read. No Jira admin rights, no Marketplace app, no public URL.
 
-> **Status: pre-alpha.** This is the walking skeleton (milestone M1): `lockkeeper run SHOP-123` takes one ticket all the way to a PR and a ticket comment. The first live run, on 16 November 2026, produced [this pull request](https://github.com/no-boolshit-AI/lockkeeper-demo/pull/1) in 48 seconds. The label trigger, the readiness check, `init` and `doctor` come in M2. See the [roadmap](docs/ROADMAP.md) and the [PRD](docs/PRD.md).
+> **Status: pre-alpha, heading for a private alpha (milestone M2).** `lockkeeper start` watches Jira and turns labelled tickets into pull requests, with a readiness check, stop and retry from the ticket, and runs that survive restarts. The first live run, on 16 November 2026, produced [this pull request](https://github.com/no-boolshit-AI/lockkeeper-demo/pull/1) in 48 seconds. See the [roadmap](docs/ROADMAP.md) and the [PRD](docs/PRD.md).
 
 ## How a run works
 
@@ -38,7 +38,7 @@ The design assumes prompt injection will sometimes succeed. It makes sure a hija
 
 Honest limits: hosted E2B and the model provider see the code and the ticket. Allowed hosts and DNS remain possible exfiltration channels. On E2B, allowing any domain also opens its DNS resolver. Agent-written code runs in your CI with your repository's secrets, so keep sensitive jobs behind protected environments. Events from inside the sandbox are telemetry, not proof. Budgets are enforced by the agent CLI and the wall clock by the control plane, and your CI stays the authority on tests.
 
-## Quickstart (walking skeleton)
+## Quickstart
 
 You need Node 22.19 or later and four accounts: Jira Cloud, GitHub, [E2B](https://e2b.dev) (the free Hobby plan works) and an Anthropic API key.
 
@@ -52,12 +52,15 @@ git clone https://github.com/no-boolshit-AI/lockkeeper.git
 cd lockkeeper && npm ci && npm run build && npm link
 ```
 
-**2. Create a GitHub App.** `lockkeeper init` will do this in one click in M2. For now, use GitHub's settings: Developer settings → GitHub Apps → New GitHub App.
-- Turn off the webhook.
-- Give it these repository permissions and nothing else: Metadata read, Contents write, Pull requests write, Checks read, Actions read, Commit statuses read, Issues read. Never Workflows, Administration or Secrets.
-- Generate a private key, then install the App. Choose "Only select repositories" and pick the ones Lockkeeper may work on.
+**2. Set it up.** In the folder where Lockkeeper should keep its config, run:
 
-**3. Configure.** Copy [`lockkeeper.example.yml`](lockkeeper.example.yml) to `lockkeeper.yml`. Then put the credentials in `.lockkeeper/.env` next to it. That folder is gitignored. Lockkeeper comments on tickets as the Jira account you give it, so use a service account if comments should not appear under your name.
+```bash
+lockkeeper init
+```
+
+It checks your Jira details and lets you pick projects and repositories. It creates the GitHub App through GitHub's own page, with exactly seven repository permissions, and asks you to install it on the repositories you chose. It checks the E2B key and stores the Anthropic key in E2B's secret store, never on disk. Then it writes `lockkeeper.yml` and `.lockkeeper/.env`, which is readable only by you and gitignored. Lockkeeper comments on tickets as the Jira account you give it, so use a service account if comments should not appear under your name.
+
+To set it up by hand instead, copy [`lockkeeper.example.yml`](lockkeeper.example.yml) to `lockkeeper.yml`, create a GitHub App with the permissions Metadata read, Contents write, Pull requests write, Checks read, Actions read, Commit statuses read and Issues read, and put the credentials in `.lockkeeper/.env`:
 
 ```
 LOCKKEEPER_JIRA_EMAIL=lockkeeper-bot@acme.com
@@ -65,20 +68,18 @@ LOCKKEEPER_JIRA_TOKEN=...            # a Jira API token
 LOCKKEEPER_GITHUB_APP_ID=123456
 LOCKKEEPER_GITHUB_PRIVATE_KEY_PATH=.lockkeeper/github-app.pem
 E2B_API_KEY=e2b_...
-ANTHROPIC_API_KEY=sk-ant-...         # only needed for the next step
+ANTHROPIC_API_KEY=sk-ant-...         # only for `lockkeeper secrets sync`
 ```
 
-**4. Move the model key into E2B, then check everything.**
+Then `lockkeeper secrets sync` moves the model key into E2B.
+
+**3. Check everything.** This starts a real sandbox, clones the repository, runs setup and the checks on the base branch, and confirms that egress is sealed and the key is added outside the sandbox. Each problem comes with a fix.
 
 ```bash
-lockkeeper secrets sync
+lockkeeper doctor
 ```
 
-```bash
-lockkeeper check --live
-```
-
-**5. Run a ticket.** Do a dry run first. It does everything except write to Jira or GitHub, and prints the diff, the PR text and the comments.
+**4. Run a ticket.** Do a dry run first. It does everything except write to Jira or GitHub, and prints the diff, the PR text and the comments.
 
 ```bash
 lockkeeper run SHOP-123 --dry-run
@@ -90,7 +91,7 @@ lockkeeper run SHOP-123
 
 Then `lockkeeper runs` lists runs, and `lockkeeper runs <id>` shows a run's audit log: the snapshot, prompts, every command the agent ran, the checks, the policy findings, the commit and the cost. `lockkeeper cancel SHOP-123` releases a ticket and deletes its sandbox.
 
-**6. Start the service.** It polls Jira, so nothing has to reach your machine from outside.
+**5. Start the service.** It polls Jira, so nothing has to reach your machine from outside.
 
 ```bash
 lockkeeper start
@@ -108,6 +109,8 @@ From the ticket, people can stop a run by removing its label or by commenting `/
 | --- | --- |
 | `lockkeeper start` | Watch Jira and run labelled tickets until stopped |
 | `lockkeeper run <ticket> [--dry-run]` | Run one ticket end to end, or continue its run if the process running it stopped |
+| `lockkeeper init` | Set up step by step: Jira, a GitHub App, E2B and the model key |
+| `lockkeeper doctor [--project KEY]` | Check everything a run needs with a real sandbox, with a fix for each problem |
 | `lockkeeper check [--live]` | Validate the config and credentials; with `--live`, call Jira, GitHub and E2B |
 | `lockkeeper secrets sync` | Store the model key as an E2B secret so it never enters a sandbox |
 | `lockkeeper runs [id]` | List runs, or show one run's audit log |

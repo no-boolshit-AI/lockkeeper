@@ -36,6 +36,8 @@ export interface AgentCredential {
   /** Header that carries the key on that host. */
   header: string;
   prefix?: string;
+  /** A cheap request that succeeds with a valid key, for `lockkeeper doctor`. */
+  probe?: { url: string; headers?: Record<string, string> };
 }
 
 export interface AgentInvocation {

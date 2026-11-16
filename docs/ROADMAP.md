@@ -86,7 +86,7 @@ Goal: a team labels tickets and gets PRs or questions back without anyone runnin
 | Acceptance-criteria evidence table. A criterion without evidence is listed as unmet and keeps the PR a draft | V4 | Done in M1 |
 | Final result comment, optional status transition | J1, J2 | Done in M1; the final comment now mentions whoever added the label |
 | `/agent stop`, removing the label, and `/agent retry` with a hint | F3 | Done. A retry adds to the open PR's branch, fast-forward only |
-| `init`: GitHub App through the manifest flow, Jira and E2B checks, config written. `doctor`: credentials, sandbox boot, clone, setup, tests, network policy, secret injection, branch rules | O1 | Not started |
+| `init`: GitHub App through the manifest flow, Jira and E2B checks, config written. `doctor`: credentials, sandbox boot, clone, setup, tests, network policy, secret injection, branch rules | O1 | Done. `doctor` passed against the live demo setup on 16 Nov 2026 |
 | Full audit trail: who triggered the run, blocked requests, cost | O2 | Trigger and cost done; blocked requests not started |
 
 Exit gate: 20 real tickets across 3 design-partner teams, at least half merged.

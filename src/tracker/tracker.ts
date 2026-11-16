@@ -83,8 +83,13 @@ export interface LabelEvent {
   id: string;
 }
 
+/** Things Lockkeeper does on tickets, for checking the account's permissions. */
+export type TrackerAbility = 'browse' | 'comment' | 'edit' | 'link' | 'transition';
+
 export interface Tracker {
   readonly kind: string;
+  /** Which of these the account cannot do in a project. */
+  missingAbilities(project: string, abilities: TrackerAbility[]): Promise<TrackerAbility[]>;
   /** The account Lockkeeper acts as. Its own comments are left out of snapshots. */
   whoami(): Promise<Person>;
   snapshot(key: string): Promise<TicketSnapshot>;

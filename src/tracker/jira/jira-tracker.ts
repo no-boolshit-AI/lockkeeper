@@ -8,6 +8,7 @@ import type {
   TicketRef,
   TicketSnapshot,
   Tracker,
+  TrackerAbility,
 } from '../tracker.js';
 import { adfToMarkdown, docToAdf } from './adf.js';
 import type { JiraClient } from './client.js';
@@ -54,6 +55,25 @@ export class JiraTracker implements Tracker {
     if (this.options.acceptanceCriteriaField)
       input.acceptanceCriteriaField = this.options.acceptanceCriteriaField;
     return buildSnapshot(input);
+  }
+
+  async missingAbilities(project: string, abilities: TrackerAbility[]): Promise<TrackerAbility[]> {
+    const keys: Record<TrackerAbility, string> = {
+      browse: 'BROWSE_PROJECTS',
+      comment: 'ADD_COMMENTS',
+      edit: 'EDIT_ISSUES',
+      link: 'LINK_ISSUES',
+      transition: 'TRANSITION_ISSUES',
+    };
+    const result = await this.client.request<{
+      permissions?: Record<string, { havePermission?: boolean }>;
+    }>('GET', '/rest/api/3/mypermissions', {
+      query: {
+        projectKey: project,
+        permissions: abilities.map((ability) => keys[ability]).join(','),
+      },
+    });
+    return abilities.filter((ability) => !result.permissions?.[keys[ability]]?.havePermission);
   }
 
   async search(query: string, limit = 50): Promise<TicketRef[]> {

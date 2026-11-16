@@ -26,6 +26,10 @@ export class ClaudeCodeAdapter implements AgentAdapter {
     env: 'ANTHROPIC_API_KEY',
     host: 'api.anthropic.com',
     header: 'x-api-key',
+    probe: {
+      url: 'https://api.anthropic.com/v1/models',
+      headers: { 'anthropic-version': '2023-06-01' },
+    },
   };
   readonly extraDomains: readonly string[] = [];
 

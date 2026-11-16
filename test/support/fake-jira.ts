@@ -9,6 +9,7 @@ import type {
   TicketRef,
   TicketSnapshot,
   Tracker,
+  TrackerAbility,
 } from '../../src/tracker/tracker.js';
 import { ticketFixture } from './fakes.js';
 
@@ -96,6 +97,13 @@ export class FakeJira implements Tracker {
   }
 
   // Tracker -----------------------------------------------------------------
+
+  /** Abilities the account lacks, for doctor tests. */
+  lacking: TrackerAbility[] = [];
+
+  async missingAbilities(_project: string, abilities: TrackerAbility[]): Promise<TrackerAbility[]> {
+    return abilities.filter((ability) => this.lacking.includes(ability));
+  }
 
   async whoami(): Promise<Person> {
     return LOCKKEEPER;

@@ -73,8 +73,21 @@ export interface BranchHead {
   message: string;
 }
 
+/** A repository rule that applies to a branch, such as a ruleset restricting creation. */
+export interface BranchRule {
+  type: string;
+  rulesetId?: number;
+}
+
 export interface SourceControl {
   readonly kind: string;
+  /**
+   * Permissions Lockkeeper needs that it lacks on the repository, such as
+   * `contents: write`. Throws, with a hint, if it has no access at all.
+   */
+  missingPermissions(repo: string): Promise<string[]>;
+  /** The repository rules that would apply to a branch with this name. */
+  branchRules(repo: string, branch: string): Promise<BranchRule[]>;
   resolveBase(repo: string, branch: string): Promise<BaseRef>;
   cloneAccess(repo: string): Promise<CloneAccess>;
   branchExists(repo: string, branch: string): Promise<boolean>;
