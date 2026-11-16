@@ -57,6 +57,27 @@ export class RecordingTracker implements Tracker {
     return this.inner.ticketUrl(key);
   }
 
+  /** Every write except comments, one line each, in order. */
+  changes(): string[] {
+    return this.writes.flatMap((write) => {
+      switch (write.action) {
+        case 'updateLabels': {
+          const parts = [
+            write.change.add?.length ? `add ${write.change.add.join(', ')}` : '',
+            write.change.remove?.length ? `remove ${write.change.remove.join(', ')}` : '',
+          ].filter(Boolean);
+          return parts.length > 0 ? [`Labels on ${write.key}: ${parts.join('; ')}`] : [];
+        }
+        case 'linkPullRequest':
+          return [`Link ${write.key} to ${write.pr.url}`];
+        case 'transition':
+          return [`Move ${write.key} to "${write.name}"`];
+        default:
+          return [];
+      }
+    });
+  }
+
   /** The latest version of each comment, in the order they were first posted. */
   comments(): { commentId: string; body: Doc }[] {
     const latest = new Map<string, Doc>();

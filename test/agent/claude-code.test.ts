@@ -47,12 +47,22 @@ describe('the Claude Code adapter', () => {
     expect(command).toContain('--max-budget-usd 3.46');
   });
 
-  it('keeps the key out of subprocesses and trusts the egress proxy CA', () => {
-    expect(adapter.environment()).toMatchObject({
-      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1',
+  it('trusts the egress proxy CA and scrubs subprocesses only when the real key is present', () => {
+    const egress = adapter.environment({ keyInEnvironment: false });
+    expect(egress).toMatchObject({
       DISABLE_AUTOUPDATER: '1',
       NODE_EXTRA_CA_CERTS: '/etc/ssl/certs/ca-certificates.crt',
     });
+    // Claude Code refuses to start with the scrub on and no bubblewrap, as in E2B's template.
+    expect(egress).not.toHaveProperty('CLAUDE_CODE_SUBPROCESS_ENV_SCRUB');
+    expect(adapter.requirements({ keyInEnvironment: false })).toEqual([]);
+
+    expect(adapter.environment({ keyInEnvironment: true })).toMatchObject({
+      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1',
+    });
+    const [requirement] = adapter.requirements({ keyInEnvironment: true });
+    expect(requirement?.check).toBe('command -v bwrap');
+    expect(requirement?.hint).toContain('key_injection: egress');
     expect(adapter.credential).toEqual({
       env: 'ANTHROPIC_API_KEY',
       host: 'api.anthropic.com',

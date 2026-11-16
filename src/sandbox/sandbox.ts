@@ -72,6 +72,8 @@ export interface SandboxHandle {
 
 export interface SandboxProvider {
   readonly kind: string;
+  /** The provider's name as people write it, such as E2B. */
+  readonly displayName: string;
   readonly capabilities: SandboxCapabilities;
   create(spec: SandboxSpec): Promise<SandboxHandle>;
   connect(id: string): Promise<SandboxHandle>;

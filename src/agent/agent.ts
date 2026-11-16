@@ -18,7 +18,9 @@ export type AgentEvent =
       /** A cap the agent itself enforced, when that is why it stopped. */
       cap?: 'turns' | 'cost';
       text: string;
+      /** Cost of the whole session so far, including earlier rounds it resumed. */
       costUsd?: number;
+      /** Turns in this invocation only. */
       turns?: number;
       sessionId?: string;
       errors?: string[];
@@ -46,8 +48,26 @@ export interface AgentInvocation {
   /** Continue `sessionId` instead of starting it (review follow-ups, F1). */
   resume: boolean;
   model?: string;
+  /** Turn cap for this invocation. */
   maxTurns: number;
+  /** Spending cap for this invocation, not counting earlier rounds of the session. */
   maxBudgetUsd: number;
+}
+
+export interface KeyPlacement {
+  /**
+   * True when the real model key is in the agent's environment (key_injection: env).
+   * False when E2B's egress proxy adds it and the environment holds only a placeholder.
+   */
+  keyInEnvironment: boolean;
+}
+
+/** Something the sandbox must provide before the agent can run safely. */
+export interface SandboxRequirement {
+  /** Shell command that exits 0 when the requirement is met. */
+  check: string;
+  problem: string;
+  hint: string;
 }
 
 export interface AgentAdapter {
@@ -62,7 +82,9 @@ export interface AgentAdapter {
   /** Shell command for one headless run. Its stdout is the event stream. */
   command(invocation: AgentInvocation): string;
   /** Environment for the agent process, apart from the credential. */
-  environment(): Record<string, string>;
+  environment(placement: KeyPlacement): Record<string, string>;
+  /** Checks to run in the sandbox before the agent starts. A failed check stops the run. */
+  requirements(placement: KeyPlacement): SandboxRequirement[];
   /** Turn one line of the agent's stdout into common events. */
   parseLine(line: string): AgentEvent[];
 }

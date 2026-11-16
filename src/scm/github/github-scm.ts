@@ -54,6 +54,8 @@ export class GitHubSourceControl implements SourceControl {
       authStrategy: createAppAuth,
       auth,
       userAgent: 'lockkeeper',
+      // Octokit prints every failed request. Lockkeeper handles those and explains them.
+      log: { debug: () => {}, info: () => {}, warn: console.warn, error: () => {} },
       ...(this.options.baseUrl ? { baseUrl: this.options.baseUrl } : {}),
       ...(this.options.fetch ? { request: { fetch: this.options.fetch } } : {}),
     });

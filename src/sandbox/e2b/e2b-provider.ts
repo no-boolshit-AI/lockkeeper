@@ -25,6 +25,7 @@ export interface E2BProviderOptions {
  */
 export class E2BProvider implements SandboxProvider {
   readonly kind = 'e2b';
+  readonly displayName = 'E2B';
   readonly capabilities = { secretInjection: true, pause: true, egressAllowList: true };
 
   constructor(private readonly options: E2BProviderOptions) {}

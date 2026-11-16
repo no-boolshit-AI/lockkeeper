@@ -14,6 +14,26 @@ export function workflowFor(issueType: string, labels: readonly string[] = []): 
   return BUG_TYPES.has(issueType.trim().toLowerCase()) ? 'bugfix' : 'feature';
 }
 
+/** Words that leave a shortened slug unfinished, as in `off-by-a-cent-with`. */
+const DANGLING_WORDS = new Set([
+  'a',
+  'an',
+  'and',
+  'as',
+  'at',
+  'by',
+  'for',
+  'from',
+  'in',
+  'into',
+  'of',
+  'on',
+  'or',
+  'the',
+  'to',
+  'with',
+]);
+
 /** Lowercase ASCII words joined by hyphens, cut at a word boundary. */
 export function slugify(text: string, maxLength = 40): string {
   const words = text
@@ -24,16 +44,19 @@ export function slugify(text: string, maxLength = 40): string {
     .trim()
     .split(/\s+/)
     .filter(Boolean);
-  let slug = '';
+  const kept: string[] = [];
+  let length = 0;
   for (const word of words) {
-    const next = slug ? `${slug}-${word}` : word;
-    if (next.length > maxLength) {
-      if (!slug) slug = word.slice(0, maxLength);
+    const next = kept.length === 0 ? word.length : length + 1 + word.length;
+    if (next > maxLength) {
+      if (kept.length === 0) return word.slice(0, maxLength);
+      while (kept.length > 1 && DANGLING_WORDS.has(kept.at(-1) ?? '')) kept.pop();
       break;
     }
-    slug = next;
+    kept.push(word);
+    length = next;
   }
-  return slug;
+  return kept.join('-');
 }
 
 /** `bugfix/KEY-123-short-title` for bugs and `feature/KEY-123-short-title` otherwise. */

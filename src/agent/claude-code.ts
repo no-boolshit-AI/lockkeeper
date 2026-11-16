@@ -1,5 +1,11 @@
 import { shellQuote } from '../sandbox/sandbox.js';
-import type { AgentAdapter, AgentEvent, AgentInvocation } from './agent.js';
+import type {
+  AgentAdapter,
+  AgentEvent,
+  AgentInvocation,
+  KeyPlacement,
+  SandboxRequirement,
+} from './agent.js';
 
 /**
  * Claude Code in headless print mode (E4).
@@ -60,15 +66,29 @@ export class ClaudeCodeAdapter implements AgentAdapter {
     return `${args.map(shellQuote).join(' ')} < ${shellQuote(invocation.promptFile)}`;
   }
 
-  environment(): Record<string, string> {
+  environment({ keyInEnvironment }: KeyPlacement): Record<string, string> {
     return {
       DISABLE_AUTOUPDATER: '1',
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-      // Keep the model key out of the agent's Bash subprocesses when it is in the environment at all.
-      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1',
       // E2B's egress proxy terminates TLS for hosts with secret rules; trust its CA.
       NODE_EXTRA_CA_CERTS: '/etc/ssl/certs/ca-certificates.crt',
+      // With the real key in the environment, keep it from the agent's shell commands.
+      // Claude Code isolates them with bubblewrap for this and refuses to start without
+      // it. With egress injection there is only a placeholder, so there is nothing to hide.
+      ...(keyInEnvironment ? { CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1' } : {}),
     };
+  }
+
+  requirements({ keyInEnvironment }: KeyPlacement): SandboxRequirement[] {
+    if (!keyInEnvironment) return [];
+    return [
+      {
+        check: 'command -v bwrap',
+        problem:
+          'The model key would be in the sandbox environment, but the sandbox has no bubblewrap, which Claude Code needs to keep the key from its shell commands.',
+        hint: 'Run `lockkeeper secrets sync` and set agent.key_injection: egress, or use a sandbox template with bubblewrap installed.',
+      },
+    ];
   }
 
   parseLine(line: string): AgentEvent[] {

@@ -50,6 +50,11 @@ describe('branch names and workflows', () => {
       'one-two-three-four',
     );
     expect(slugify('Supercalifragilisticexpialidocious', 10)).toBe('supercalif');
+    // From the first live run: a cut slug no longer ends on a connecting word.
+    expect(slugify('Cart total is off by a cent with discounts')).toBe(
+      'cart-total-is-off-by-a-cent',
+    );
+    expect(slugify('Sign in with')).toBe('sign-in-with');
   });
 
   it('keeps titles short and keyed', () => {

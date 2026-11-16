@@ -9,7 +9,7 @@ Dates assume work started on 16 November 2026 with one or two engineers, as the 
 | Milestone | PRD phase | Target | Outcome | Exit gate | Status |
 | --- | --- | --- | --- | --- | --- |
 | M0 Foundation | (none) | 17 Nov 2026 | Repository, toolchain, CI, licence, the four extension interfaces, config schema | CI green on `main` | Done |
-| M1 Walking skeleton | Weeks 1-2 | 29 Nov 2026 | `lockkeeper run PROJ-1` turns a ticket into a draft PR and a Jira comment, using Claude Code in an E2B sandbox | A demo ticket becomes a draft PR in under 15 minutes | Code complete; not yet run against live services |
+| M1 Walking skeleton | Weeks 1-2 | 29 Nov 2026 | `lockkeeper run PROJ-1` turns a ticket into a draft PR and a Jira comment, using Claude Code in an E2B sandbox | A demo ticket becomes a draft PR in under 15 minutes | Exit gate met on 16 Nov 2026 |
 | M2 Private alpha | Weeks 3-6 | 27 Dec 2026 | Label trigger, readiness check, caps, verification, `init` and `doctor`, with three to five design partners | 20 real tickets across 3 teams, at least half merged | Not started |
 | M3 Public beta | Weeks 7-10 | 24 Jan 2027 | Review follow-ups, pause and resume, Codex CLI and OpenCode adapters, `demo`, run page, Docker image, security docs | Five fresh installs each reach a first PR in under 15 minutes | Not started |
 | M4 1.0 | Weeks 11-14 | 21 Feb 2027 | Hardening, evaluation suite, upgrade path, contribution guide | No open critical security finding, and the merge-rate target met at design partners | Not started |
@@ -37,24 +37,38 @@ Goal: prove the full loop once, by hand: `lockkeeper run PROJ-1` snapshots the t
 | Refuse tickets with `customer` authors unless the project opts in | T3 | Built |
 | Project-to-repository mapping from config, with component and label overrides; ask when they disagree | T5 | Built (ahead of plan) |
 | One active run per ticket, enforced by the store | T6 (basic) | Built |
-| E2B sandbox per run: explicit timeout, metadata, pause on timeout, egress denied except an allow-list | E1, E2 | Built, not yet run live |
-| Clone with a short-lived, read-only, single-repository token that is never written to disk; model key added at E2B's egress proxy; no Jira or GitHub write token in the sandbox | E3 | Built, not yet run live |
-| Claude Code adapter: headless `--bare`, structured event stream, turn and budget caps, no repository hooks, settings or MCP servers | E4 | Built, not yet run live |
+| E2B sandbox per run: explicit timeout, metadata, pause on timeout, egress denied except an allow-list | E1, E2 | Built, run live |
+| Clone with a short-lived, read-only, single-repository token that is never written to disk; model key added at E2B's egress proxy; no Jira or GitHub write token in the sandbox | E3 | Built, run live |
+| Claude Code adapter: headless `--bare`, structured event stream, turn and budget caps, no repository hooks, settings or MCP servers | E4 | Built, run live |
 | `feature` and `bugfix` prompts and branch names by issue type, with a label override | E5 | Built (ahead of plan) |
 | Setup and verify commands from `lockkeeper.yml` or detected, with the log tail reported on failure | E6 (basic) | Built |
 | Verification outside the agent, with up to two fix rounds in the same agent session | V1 | Built (ahead of plan) |
 | Wall-clock, budget, turn, fix-round, diff-size and parallel-run caps, named on the ticket when hit | E7 | Built |
 | Diff policy: protected paths, size cap, no submodules, secret scan of the diff and of every text the agent wrote | V2 | Built |
-| Branch, verified commit and PR created through the GitHub API under the App identity. No merge code path | V3, V5 | Built, not yet run live |
+| Branch, verified commit and PR created through the GitHub API under the App identity. No merge code path | V3, V5 | Built, run live |
 | PR body with summary, acceptance-criteria evidence, commands and results, risks, agent, time and cost. A criterion without evidence keeps a draft | V4 | Built (ahead of plan) |
 | One status comment edited in place, a separate final comment, PR remote link, labels, optional transition | J1, J2 | Built |
 | SQLite store with runs and an audit log of the snapshot, prompts, commands, agent events, checks and commits | O2 (basic) | Built |
 | `lockkeeper check --live`: config, credentials, Jira access, repository access and the E2B secret | O1 (early part) | Built |
-| Spike: does E2B secret injection work with Claude Code? Procedure in [docs/spikes/e2b-secret-injection.md](spikes/e2b-secret-injection.md) | Open question 4 | Not run: needs E2B and Anthropic credentials |
+| Spike: does E2B secret injection work with Claude Code? Results in [docs/spikes/e2b-secret-injection.md](spikes/e2b-secret-injection.md) | Open question 4 | Passed on 16 Nov 2026 |
 
-Exit gate: a demo ticket on a real Jira site becomes a draft PR in under 15 minutes. Not yet met: it needs a live run with real Jira, GitHub App, E2B and Anthropic credentials.
+Exit gate: a demo ticket on a real Jira site becomes a draft PR in under 15 minutes. **Met on 16 November 2026.** A bug ticket on a Jira Cloud site became [no-boolshit-AI/lockkeeper-demo#1](https://github.com/no-boolshit-AI/lockkeeper-demo/pull/1), a ready-for-review PR with a verified commit, 48 seconds after the run started, for $0.06. The ticket got its status comment, a final comment for the reporter, the PR link and the in-review label. The sandbox was paused for review.
 
-Known gaps to close in M2: the agent's event stream comes from inside the sandbox and is treated as telemetry, not proof. Cleanup of lingering agent processes before verification is best effort, by session. Allowing any domain on E2B also opens its DNS resolver.
+The live run found four problems, all fixed:
+
+- Claude Code refused to start, because subprocess scrubbing needs bubblewrap and E2B's template has none.
+- Fix rounds each got the full turn cap.
+- Dry runs did not preview every Jira write.
+- Shortened branch names could end on a word like "with".
+
+Known gaps to close in M2:
+
+- The agent's event stream comes from inside the sandbox and is treated as telemetry, not proof.
+- Cleanup of lingering agent processes before verification is best effort, by session.
+- Allowing any domain on E2B also opens its DNS resolver.
+- The sandbox user has passwordless sudo.
+- GitHub stays reachable while the agent works. E2B's `updateNetwork` could close it after the clone.
+- Paused sandboxes stay until the cleanup planned for M3.
 
 ## M2 Private alpha (weeks 3-6)
 
@@ -125,7 +139,7 @@ The PRD lists the owners. Until they answer, work proceeds on these defaults:
 | --- | --- |
 | What the project is for | A community tool under Apache-2.0 with no hosted plan |
 | The name | Lockkeeper as a working name. `lockkeeper` was free on npm on 16 November 2026 |
-| E2B secret injection with each agent CLI | M1 spike. Until it passes, the model key goes only into the agent process's environment, with a warning |
+| E2B secret injection with each agent CLI | Works with Claude Code (M1 spike, 16 Nov 2026). Other agents get the same check when their adapters land. The `env` fallback needs bubblewrap in the sandbox template |
 | Default agent | Claude Code, as a config value |
 | Commits through the API or a git bundle | API commits, for verified signatures |
 | Follow-ups on every changes-requested review, or only `/agent` | Both, configurable per project (M3) |

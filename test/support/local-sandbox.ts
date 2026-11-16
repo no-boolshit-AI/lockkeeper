@@ -17,6 +17,7 @@ import type {
  */
 export class LocalSandboxProvider implements SandboxProvider {
   readonly kind = 'local-test';
+  readonly displayName = 'the local test provider';
   readonly capabilities = { secretInjection: false, pause: true, egressAllowList: false };
   readonly specs: SandboxSpec[] = [];
   readonly sandboxes: LocalSandbox[] = [];

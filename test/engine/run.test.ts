@@ -1,11 +1,12 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import type { AgentAdapter, SandboxRequirement } from '../../src/agent/agent.js';
 import { ClaudeCodeAdapter } from '../../src/agent/claude-code.js';
 import { docToPlainText } from '../../src/core/doc.js';
 import { AlreadyActiveError, type CapExceededError } from '../../src/core/errors.js';
-import { type RunDeps, runTicket } from '../../src/engine/run.js';
+import { type ModelKey, type RunDeps, runTicket } from '../../src/engine/run.js';
 import { Store } from '../../src/store/store.js';
 import type { TicketSnapshot } from '../../src/tracker/tracker.js';
 import {
@@ -46,6 +47,7 @@ interface AgentCall {
   systemPrompt: string;
   credentialEnv: string[];
   anthropicKey: string;
+  scrub: string | null;
 }
 
 function harness(options: {
@@ -53,14 +55,23 @@ function harness(options: {
   config?: string;
   ticket?: TicketSnapshot;
   files?: Record<string, string>;
+  modelKey?: ModelKey;
+  agent?: AgentAdapter;
+  /** Extra executables for the sandbox's PATH, by name and shell body. */
+  bin?: Record<string, string>;
 }) {
   const root = mkdtempSync(join(tmpdir(), 'lockkeeper-run-'));
   const remote = makeRemoteRepo(root, options.files ?? { 'README.md': '# Demo\n' });
   const script = join(root, 'agent-script.json');
   writeFileSync(script, JSON.stringify({ rounds: options.rounds }));
+  const binDir = makeBinDir(root);
+  for (const [name, body] of Object.entries(options.bin ?? {})) {
+    writeFileSync(join(binDir, name), `#!/bin/sh\n${body}\n`);
+    chmodSync(join(binDir, name), 0o755);
+  }
   const sandboxes = new LocalSandboxProvider({
     root,
-    binDir: makeBinDir(root),
+    binDir,
     env: { FAKE_AGENT_SCRIPT: script },
   });
   const tracker = fakeTracker(options.ticket ?? ticketFixture());
@@ -71,9 +82,9 @@ function harness(options: {
     tracker,
     scm,
     sandboxes,
-    agent: new ClaudeCodeAdapter(),
+    agent: options.agent ?? new ClaudeCodeAdapter(),
     store,
-    modelKey: { mode: 'egress', secretName: 'lk-test-key' },
+    modelKey: options.modelKey ?? { mode: 'egress', secretName: 'lk-test-key' },
     pollMs: 20,
   };
   const sandbox = () => {
@@ -176,6 +187,7 @@ describe('runTicket', () => {
     const call = h.call(0);
     expect(call.anthropicKey).toBe('lockkeeper-key-added-by-egress-proxy');
     expect(call.credentialEnv).toEqual(['ANTHROPIC_API_KEY']);
+    expect(call.scrub).toBeNull();
     expect(call.args).toEqual(
       expect.arrayContaining(['--bare', '--strict-mcp-config', '--setting-sources', 'user']),
     );
@@ -200,6 +212,40 @@ describe('runTicket', () => {
     });
   });
 
+  it('passes the key in the environment only with subprocess isolation', async () => {
+    h = harness({
+      rounds: [{ writes: { 'hello.txt': 'hello\n' }, text: report() }],
+      modelKey: { mode: 'env', value: 'sk-test-env-key' },
+      bin: { bwrap: 'exit 0' },
+    });
+    const result = await runTicket(h.deps, { ticketKey: 'DEMO-1', triggeredBy: 'test' });
+
+    expect(result.outcome).toBe('pr');
+    expect(h.call(0).anthropicKey).toBe('sk-test-env-key');
+    expect(h.call(0).scrub).toBe('1');
+    expect(h.sandboxes.specs[0]?.secrets).toEqual([]);
+  });
+
+  it('stops before cloning when the sandbox cannot meet an agent requirement', async () => {
+    class NeedsTool extends ClaudeCodeAdapter {
+      override requirements(): SandboxRequirement[] {
+        return [{ check: 'exit 1', problem: 'The sandbox lacks a tool.', hint: 'Add the tool.' }];
+      }
+    }
+    h = harness({
+      rounds: [{ writes: { 'hello.txt': 'hello\n' }, text: report() }],
+      agent: new NeedsTool(),
+    });
+    const result = await runTicket(h.deps, { ticketKey: 'DEMO-1', triggeredBy: 'test' });
+
+    expect(result.outcome).toBe('failed');
+    if (result.outcome !== 'failed') return;
+    expect(result.error.message).toBe('The sandbox lacks a tool.');
+    expect(h.sandbox().commands.some((entry) => entry.command.includes('git clone'))).toBe(false);
+    expect(h.sandbox().destroyed).toBe(true);
+    expect(h.comments().join('\n')).toContain('Add the tool.');
+  });
+
   it('runs a fix round when checks fail and resumes the same agent session', async () => {
     h = harness({
       rounds: [
@@ -217,7 +263,12 @@ describe('runTicket', () => {
     expect(second.args[second.args.indexOf('--resume') + 1]).toBe(sessionId);
     expect(second.prompt).toContain('grep -q hello hello.txt');
     expect(h.comments()[0]).toContain('1 fix round');
+    // The fake reports cost per session and turns per call, like Claude Code. The fix
+    // round gets what is left of both caps.
     expect(result.run.costUsd).toBe(0.5);
+    expect(result.run.turns).toBe(8);
+    expect(second.args[second.args.indexOf('--max-turns') + 1]).toBe('146');
+    expect(second.args[second.args.indexOf('--max-budget-usd') + 1]).toBe('9.75');
   });
 
   it('opens a draft and says why when checks still fail after the fix rounds', async () => {
@@ -343,8 +394,18 @@ describe('runTicket', () => {
       { path: 'hello.txt', status: 'added', added: 1, removed: 0 },
     ]);
     expect(result.preview.body).toContain('## What changed');
-    expect(result.preview.comments.at(-1)).toContain('dry run');
+    // The preview shows every write a real run would make, including the final notice.
+    const [status, notice] = result.preview.comments;
+    expect(status).toContain('ready for review');
+    expect(notice).toContain('@Maria');
+    expect(result.preview.trackerChanges).toEqual([
+      'Labels on DEMO-1: add agent-working; remove agent',
+      'Link DEMO-1 to (dry run: no pull request)',
+      'Labels on DEMO-1: add agent-in-review; remove agent-working',
+    ]);
     expect(result.run.state).toBe('done');
+    expect(result.run.turns).toBe(4);
+    expect(h.sandbox().destroyed).toBe(true);
   });
 
   it('uses the bugfix workflow and passes base-branch instructions to the agent', async () => {

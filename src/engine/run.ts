@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { AgentAdapter, AgentEvent } from '../agent/agent.js';
+import type { AgentAdapter, AgentEvent, KeyPlacement } from '../agent/agent.js';
 import {
   type Config,
   type ProjectSettings,
@@ -102,6 +102,8 @@ export interface DryRunPreview {
   title: string;
   body: string;
   comments: string[];
+  /** Label changes, links and transitions, one line each. */
+  trackerChanges: string[];
   files: { path: string; status: string; added: number | null; removed: number | null }[];
   draftReasons: string[];
 }
@@ -250,7 +252,7 @@ class TicketRun {
       extra: config.sandbox.allow_domains,
       ...(config.sandbox.registries ? { registries: config.sandbox.registries } : {}),
     });
-    this.log.step(`Starting a ${sandboxes.kind} sandbox`);
+    this.log.step(`Starting a sandbox on ${sandboxes.displayName}`);
     const spec = {
       timeoutMs: this.sandboxTimeout(),
       metadata: {
@@ -293,6 +295,10 @@ class TicketRun {
     }
     const version = await sandbox.exec(agent.versionCommand(), { timeoutMs: 60_000 });
     this.audit('agent_version', { output: version.stdout.trim(), exitCode: version.exitCode });
+    for (const requirement of agent.requirements(this.keyPlacement())) {
+      const check = await sandbox.exec(requirement.check, { timeoutMs: 30_000 });
+      if (check.exitCode !== 0) throw new ConfigError(requirement.problem, requirement.hint);
+    }
     this.checkCancelled();
 
     // Clone with a read-only, single-repository, short-lived token (E3).
@@ -529,82 +535,44 @@ class TicketRun {
       ),
     );
     const draft = input.draftReasons.length > 0;
+    const dryRun = this.request.dryRun === true;
 
-    if (this.request.dryRun) {
-      const outcome = {
-        pr: { url: '(dry run: no pull request)', number: 0, draft },
+    let pr: PullRequest = { url: '(dry run: no pull request)', number: 0, draft, state: 'none' };
+    if (!dryRun) {
+      // V3: commits and the PR are created here, under the App identity, never in the sandbox.
+      const message = `${title}\n\n${input.summary}\n\nTicket: ${ticket.url}\nLockkeeper-Run: ${this.run.id}\nAgent: ${this.deps.agent.displayName}\n`;
+      const commit = await scm.commit({
+        repo: this.settings.repo,
         branch,
-        criteria: input.criteria,
-        checks: input.checks,
-        draftReasons: input.draftReasons,
-        summary: input.summary,
-        costUsd: this.costUsd,
-        durationMs,
-        fixRounds: this.fixRounds,
-      };
-      if (this.statusCommentId)
-        await this.tracker.updateComment(key, this.statusCommentId, resultDoc(ctx, outcome));
-      await this.sandbox?.destroy();
-      this.sandbox = undefined;
-      this.update({
-        state: 'done',
-        finishedAt: new Date(this.now()).toISOString(),
-        costUsd: this.costUsd ?? null,
+        parentSha: input.base.sha,
+        message,
+        changes: collected.changes,
+        createBranch: true,
       });
-      return {
-        outcome: 'dry_run',
-        run: this.run,
-        preview: {
-          branch,
-          title,
-          body,
-          comments: (this.tracker as RecordingTracker)
-            .comments()
-            .map((comment) => docToPlainText(comment.body)),
-          files: collected.files.map((file) => ({
-            path: file.path,
-            status: file.status,
-            added: file.added,
-            removed: file.removed,
-          })),
-          draftReasons: input.draftReasons,
-        },
-      };
+      this.update({ branch, headSha: commit.sha });
+      this.audit('commit', {
+        sha: commit.sha,
+        url: commit.url,
+        verified: commit.verified,
+        branch,
+        paths: collected.files.map((file) => file.path),
+      });
+      this.log.step(`Committed ${commit.sha.slice(0, 12)} to ${branch}`);
+
+      pr = await scm.openPullRequest({
+        repo: this.settings.repo,
+        head: branch,
+        base: this.settings.baseBranch,
+        title,
+        body,
+        draft,
+      });
+      this.update({ prNumber: pr.number, prUrl: pr.url });
+      this.audit('pull_request', pr);
+      this.log.step(`Opened ${pr.draft || draft ? 'draft ' : ''}pull request ${pr.url}`);
     }
 
-    // V3: commits and the PR are created here, under the App identity, never in the sandbox.
-    const message = `${title}\n\n${input.summary}\n\nTicket: ${ticket.url}\nLockkeeper-Run: ${this.run.id}\nAgent: ${this.deps.agent.displayName}\n`;
-    const commit = await scm.commit({
-      repo: this.settings.repo,
-      branch,
-      parentSha: input.base.sha,
-      message,
-      changes: collected.changes,
-      createBranch: true,
-    });
-    this.update({ branch, headSha: commit.sha });
-    this.audit('commit', {
-      sha: commit.sha,
-      url: commit.url,
-      verified: commit.verified,
-      branch,
-      paths: collected.files.map((file) => file.path),
-    });
-    this.log.step(`Committed ${commit.sha.slice(0, 12)} to ${branch}`);
-
-    const pr = await scm.openPullRequest({
-      repo: this.settings.repo,
-      head: branch,
-      base: this.settings.baseBranch,
-      title,
-      body,
-      draft,
-    });
-    this.update({ prNumber: pr.number, prUrl: pr.url });
-    this.audit('pull_request', pr);
-    this.log.step(`Opened ${pr.draft || draft ? 'draft ' : ''}pull request ${pr.url}`);
-
-    // J1, J2
+    // J1, J2. A dry run makes the same calls, and the recording tracker keeps them.
     this.setState('report');
     const outcome = {
       pr: { url: pr.url, number: pr.number, draft },
@@ -630,6 +598,36 @@ class TicketRun {
       this.log.warn(`No "${transition}" transition is available on ${key}.`);
     }
 
+    if (dryRun) {
+      await this.sandbox?.destroy();
+      this.sandbox = undefined;
+      this.update({
+        state: 'done',
+        finishedAt: new Date(this.now()).toISOString(),
+        costUsd: this.costUsd ?? null,
+        turns: this.turns ?? null,
+      });
+      const recorder = this.tracker as RecordingTracker;
+      return {
+        outcome: 'dry_run',
+        run: this.run,
+        preview: {
+          branch,
+          title,
+          body,
+          comments: recorder.comments().map((comment) => docToPlainText(comment.body)),
+          trackerChanges: recorder.changes(),
+          files: collected.files.map((file) => ({
+            path: file.path,
+            status: file.status,
+            added: file.added,
+            removed: file.removed,
+          })),
+          draftReasons: input.draftReasons,
+        },
+      };
+    }
+
     // F2: park the sandbox while the PR is in review.
     if (this.sandbox) {
       if (this.deps.sandboxes.capabilities.pause) await this.sandbox.pause();
@@ -652,20 +650,32 @@ class TicketRun {
     await sandbox.exec(`mkdir -p '${files.dir}'`, { timeoutMs: 30_000 });
     await sandbox.writeFile(files.system, input.system);
     await sandbox.writeFile(files.prompt, input.prompt);
-    const budget = Math.max(0.01, config.limits.cost_usd - (this.costUsd ?? 0));
+    // Each round gets what is left of the run's caps.
+    const budget = config.limits.cost_usd - (this.costUsd ?? 0);
+    const turnsLeft = config.limits.turns - (this.turns ?? 0);
+    if (budget < 0.01)
+      throw new CapExceededError(
+        'cost',
+        `The run reached its cost limit of $${config.limits.cost_usd}.`,
+      );
+    if (turnsLeft < 1)
+      throw new CapExceededError(
+        'turns',
+        `The agent reached its limit of ${config.limits.turns} turns.`,
+      );
     const invocation = {
       workdir: layout.repo,
       promptFile: files.prompt,
       systemPromptFile: files.system,
       sessionId: input.sessionId,
       resume: round > 0,
-      maxTurns: config.limits.turns,
+      maxTurns: turnsLeft,
       maxBudgetUsd: budget,
       ...(config.agent.model ? { model: config.agent.model } : {}),
     };
     const command = agent.command(invocation);
     const env = {
-      ...agent.environment(),
+      ...agent.environment(this.keyPlacement()),
       [agent.credential.env]: modelKey.mode === 'env' ? modelKey.value : PLACEHOLDER_KEY,
     };
     await this.extendSandbox(this.sandboxTimeout());
@@ -690,9 +700,9 @@ class TicketRun {
       outcome: watch.result?.outcome,
       stderr: tail(watch.stderr, 30),
     });
+    // Cost is the session total so far; turns are this round's only (see AgentEvent).
     if (watch.result?.costUsd !== undefined) this.costUsd = watch.result.costUsd;
-    if (watch.result?.turns !== undefined)
-      this.turns = Math.max(this.turns ?? 0, watch.result.turns);
+    if (watch.result?.turns !== undefined) this.turns = (this.turns ?? 0) + watch.result.turns;
 
     if (watch.stopped === 'cancelled')
       throw new RunCancelledError('The run was stopped before the agent finished.');
@@ -921,6 +931,10 @@ class TicketRun {
    * Push the sandbox's expiry out before a long step. Best effort: the timeout set at
    * creation already covers the run, and plans cap continuous runtime differently.
    */
+  private keyPlacement(): KeyPlacement {
+    return { keyInEnvironment: this.deps.modelKey.mode === 'env' };
+  }
+
   private async extendSandbox(timeoutMs: number): Promise<void> {
     try {
       await this.sandbox?.keepAlive(timeoutMs);

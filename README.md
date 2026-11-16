@@ -4,7 +4,7 @@ Lockkeeper turns a labelled Jira ticket into a reviewable GitHub pull request. A
 
 It is for Jira Cloud teams that want agent delivery on their own terms: their keys, their choice of agent and model, per-project rules, and code they can read. No Jira admin rights, no Marketplace app, no public URL.
 
-> **Status: pre-alpha.** This is the walking skeleton (milestone M1): `lockkeeper run SHOP-123` takes one ticket all the way to a PR and a ticket comment. The label trigger, the readiness check, `init` and `doctor` come in M2. See the [roadmap](docs/ROADMAP.md) and the [PRD](docs/PRD.md).
+> **Status: pre-alpha.** This is the walking skeleton (milestone M1): `lockkeeper run SHOP-123` takes one ticket all the way to a PR and a ticket comment. The first live run, on 16 November 2026, produced [this pull request](https://github.com/no-boolshit-AI/lockkeeper-demo/pull/1) in 48 seconds. The label trigger, the readiness check, `init` and `doctor` come in M2. See the [roadmap](docs/ROADMAP.md) and the [PRD](docs/PRD.md).
 
 ## How a run works
 
@@ -54,9 +54,9 @@ cd lockkeeper && npm ci && npm run build && npm link
 **2. Create a GitHub App.** `lockkeeper init` will do this in one click in M2. For now, use GitHub's settings: Developer settings → GitHub Apps → New GitHub App.
 - Turn off the webhook.
 - Give it these repository permissions and nothing else: Metadata read, Contents write, Pull requests write, Checks read, Actions read, Commit statuses read, Issues read. Never Workflows, Administration or Secrets.
-- Generate a private key, then install the App on the repositories you want to use.
+- Generate a private key, then install the App. Choose "Only select repositories" and pick the ones Lockkeeper may work on.
 
-**3. Configure.** Copy [`lockkeeper.example.yml`](lockkeeper.example.yml) to `lockkeeper.yml`. Then put the credentials in `.lockkeeper/.env` next to it. That folder is gitignored.
+**3. Configure.** Copy [`lockkeeper.example.yml`](lockkeeper.example.yml) to `lockkeeper.yml`. Then put the credentials in `.lockkeeper/.env` next to it. That folder is gitignored. Lockkeeper comments on tickets as the Jira account you give it, so use a service account if comments should not appear under your name.
 
 ```
 LOCKKEEPER_JIRA_EMAIL=lockkeeper-bot@acme.com

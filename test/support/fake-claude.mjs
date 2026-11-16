@@ -37,6 +37,7 @@ writeFileSync(
       .filter((name) => /KEY|TOKEN|SECRET|PASSWORD|LOCKKEEPER|AUTH/i.test(name))
       .sort(),
     anthropicKey: process.env.ANTHROPIC_API_KEY,
+    scrub: process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB ?? null,
   }),
 );
 

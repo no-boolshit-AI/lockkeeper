@@ -111,6 +111,11 @@ function printResult(result: RunResult): void {
       out(preview.body);
       out('--- Jira comments ---\n');
       for (const comment of preview.comments) out(`${comment}\n`);
+      if (preview.trackerChanges.length > 0) {
+        out('--- Other Jira changes ---\n');
+        for (const change of preview.trackerChanges) out(`  ${change}`);
+        out();
+      }
       break;
     }
   }
