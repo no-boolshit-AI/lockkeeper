@@ -16,6 +16,7 @@ import {
   buildSystemPrompt,
   matchCriteria,
   parseAgentReport,
+  parseReadiness,
   renderTicket,
   stripReport,
 } from '../../src/engine/prompts.js';
@@ -276,5 +277,41 @@ describe('the allow-list (T2)', () => {
     expect(await new Authorizer(lookups, [id]).check({ ...bob, accountId: id })).toEqual({
       allowed: true,
     });
+  });
+});
+
+describe('the readiness verdict (R1)', () => {
+  const block = (json: string) =>
+    `Looked at it.\n<lockkeeper-readiness>\n${json}\n</lockkeeper-readiness>`;
+
+  it('reads ready, needs_info and declined', () => {
+    expect(parseReadiness(block('{"verdict":"ready","plan":"Change cart.js."}'))).toEqual({
+      verdict: 'ready',
+      questions: [],
+      reason: '',
+      plan: 'Change cart.js.',
+    });
+    const asked = parseReadiness(
+      block(
+        JSON.stringify({
+          verdict: 'needs_info',
+          questions: ['One?', ' ', 'Two?', 'Three?', 'Four?', 'Five?', 'Six?'],
+          reason: 'Unclear.',
+        }),
+      ),
+    );
+    expect(asked?.questions).toEqual(['One?', 'Two?', 'Three?', 'Four?', 'Five?']);
+    expect(parseReadiness(block('{"verdict":"declined","reason":"Not code."}'))?.verdict).toBe(
+      'declined',
+    );
+  });
+
+  it('treats unanswerable or unreadable verdicts sensibly', () => {
+    // Needs info but asks nothing: nothing to answer, so go ahead.
+    expect(parseReadiness(block('{"verdict":"needs_info","questions":[]}'))?.verdict).toBe('ready');
+    expect(parseReadiness(block('{"verdict":"maybe"}'))).toBeUndefined();
+    expect(parseReadiness(block('not json'))).toBeUndefined();
+    expect(parseReadiness('No block at all.')).toBeUndefined();
+    expect(parseReadiness(block('```json\n{"verdict":"ready"}\n```'))?.verdict).toBe('ready');
   });
 });

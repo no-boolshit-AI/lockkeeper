@@ -25,12 +25,23 @@ const REPORT = `Done.\n<lockkeeper-report>\n${JSON.stringify({
   risks: [],
 })}\n</lockkeeper-report>`;
 
-function harness(options: { allowUsers?: string[]; parallelRuns?: number; sleepMs?: number } = {}) {
+const ROUND = { writes: { 'hello.txt': 'hello\n' }, text: REPORT };
+
+function harness(
+  options: {
+    allowUsers?: string[];
+    parallelRuns?: number;
+    sleepMs?: number;
+    /** Agent steps in order, replacing the default single implementation step. */
+    rounds?: object[];
+    readiness?: boolean;
+  } = {},
+) {
   const root = mkdtempSync(join(tmpdir(), 'lockkeeper-daemon-'));
   const remote = makeRemoteRepo(root, { 'README.md': '# Demo\n' });
   const script = join(root, 'agent-script.json');
-  const round = { writes: { 'hello.txt': 'hello\n' }, text: REPORT, sleepMs: options.sleepMs ?? 0 };
-  writeFileSync(script, JSON.stringify({ rounds: [round] }));
+  const round = { ...ROUND, sleepMs: options.sleepMs ?? 0 };
+  writeFileSync(script, JSON.stringify({ rounds: options.rounds ?? [round] }));
   const sandboxes = new LocalSandboxProvider({
     root,
     binDir: makeBinDir(root),
@@ -47,6 +58,8 @@ store:
   path: ':memory:'
 limits:
   parallel_runs: ${options.parallelRuns ?? 3}
+readiness:
+  enabled: ${options.readiness ?? false}
 repo:
   setup: []
   verify: ['test -f hello.txt', 'grep -q hello hello.txt']
@@ -270,6 +283,58 @@ describe('the daemon', () => {
     expect(h.scm.commits.map((commit) => commit.createBranch)).toEqual([true, false]);
     expect(h.scm.updates).toHaveLength(1);
     expect(h.jira.issue('DEMO-1').labels).toEqual(['agent-in-review']);
+  });
+
+  it('asks questions, then continues with the answers when someone allowed replies /agent go', async () => {
+    const ask = `Read it.\n<lockkeeper-readiness>\n${JSON.stringify({
+      verdict: 'needs_info',
+      questions: ['Where should the greeting go?'],
+      reason: 'The ticket does not say.',
+    })}\n</lockkeeper-readiness>`;
+    h = harness({ readiness: true, rounds: [{ text: ask }] });
+    h.jira.addIssue('DEMO-1');
+    h.jira.addLabel('DEMO-1', 'agent', bob);
+    await h.daemon.tick();
+    await h.daemon.settle();
+
+    expect(h.runFor('DEMO-1')?.state).toBe('needs_info');
+    expect(h.jira.issue('DEMO-1').labels).toEqual(['agent-needs-info']);
+    // The questions mention whoever added the label.
+    expect(h.jira.texts('DEMO-1')[1]).toContain('@Bob');
+    expect(h.jira.texts('DEMO-1')[1]).toContain('Where should the greeting go?');
+    // Waiting runs hold no sandbox and no run slot.
+    expect(h.store.countExecutingRuns()).toBe(0);
+
+    writeFileSync(join(h.root, 'agent-script.json'), JSON.stringify({ rounds: [ROUND] }));
+    h.jira.comment('DEMO-1', bob, '/agent go In hello.txt at the root.');
+    await h.daemon.tick();
+    await h.daemon.settle();
+
+    const run = h.runFor('DEMO-1');
+    expect(run?.state).toBe('in_review');
+    expect(h.scm.pullRequests).toHaveLength(1);
+    expect(h.store.latestEvent(run?.id ?? '', 'answers')).toMatchObject({
+      by: 'Bob',
+      text: 'In hello.txt at the root.',
+    });
+  });
+
+  it('cancels a run waiting for answers when its label is removed', async () => {
+    const ask = `<lockkeeper-readiness>\n${JSON.stringify({
+      verdict: 'needs_info',
+      questions: ['Which colour?'],
+    })}\n</lockkeeper-readiness>`;
+    h = harness({ readiness: true, rounds: [{ text: ask }] });
+    h.jira.addIssue('DEMO-1');
+    h.jira.addLabel('DEMO-1', 'agent', maria);
+    await h.daemon.tick();
+    await h.daemon.settle();
+    expect(h.runFor('DEMO-1')?.state).toBe('needs_info');
+
+    h.jira.removeLabel('DEMO-1', 'agent-needs-info');
+    await h.daemon.tick();
+    expect(h.runFor('DEMO-1')?.state).toBe('cancelled');
+    expect(h.jira.texts('DEMO-1')[0]).toContain('agent-needs-info label was removed');
   });
 
   it('resumes the runs a previous process left, and leaves its own to resume', async () => {

@@ -229,6 +229,6 @@ projects:
     base_branch: main
 store:
   path: ':memory:'
-${extra}
+${extra.includes('readiness:') ? '' : 'readiness:\n  enabled: false\n'}${extra}
 `);
 }

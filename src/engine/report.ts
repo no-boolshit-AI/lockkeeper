@@ -7,6 +7,7 @@ import {
   heading,
   type Inline,
   link,
+  numbered,
   paragraph,
   table,
   tasks,
@@ -163,6 +164,66 @@ export function noChangesDoc(
   return doc;
 }
 
+/**
+ * R2: the readiness check's questions, in a comment of their own so the requester is
+ * notified (J1). The questions are agent text: cleaned, capped and rendered escaped.
+ */
+export function questionsDoc(
+  ctx: RunContext,
+  input: { questions: string[]; reason: string; label: string },
+): Doc {
+  const doc: Doc = [
+    paragraph(
+      ...mentionOf(ctx.requester ?? ctx.ticket.reporter),
+      text(`Lockkeeper needs a few answers before it starts on ${ctx.ticket.key}.`),
+    ),
+  ];
+  if (input.reason) doc.push(paragraph(input.reason));
+  doc.push(numbered(...input.questions));
+  doc.push(
+    paragraph(
+      'Reply with ',
+      code('/agent go'),
+      ' and your answers, or update the ticket and reply ',
+      code('/agent go'),
+      `. Removing the ${input.label} label cancels the run.`,
+    ),
+  );
+  return doc;
+}
+
+/** The status comment while a run waits for answers. */
+export function waitingDoc(
+  ctx: RunContext,
+  check: { costUsd: number | undefined; durationMs: number },
+): Doc {
+  return [
+    header(ctx, 'waiting for answers'),
+    paragraph(
+      'The readiness check found open questions, asked in a separate comment. The run continues when someone replies /agent go.',
+    ),
+    paragraph(
+      `Readiness check: ${formatDuration(check.durationMs)} · ${formatCost(check.costUsd)} · ${ctx.agentName} · ${ctx.runId}`,
+    ),
+  ];
+}
+
+/** The status comment when the readiness check declines the ticket. */
+export function declinedDoc(
+  ctx: RunContext,
+  check: { reason: string; costUsd: number | undefined; durationMs: number },
+): Doc {
+  return [
+    header(ctx, 'declined'),
+    paragraph('The readiness check decided this ticket cannot be built as written:'),
+    paragraph(check.reason),
+    paragraph('Edit the ticket and add the label again, or comment /agent retry with a note.'),
+    paragraph(
+      `Readiness check: ${formatDuration(check.durationMs)} · ${formatCost(check.costUsd)} · ${ctx.agentName} · ${ctx.runId}`,
+    ),
+  ];
+}
+
 export function failedDoc(
   ctx: RunContext,
   failure: { reason: string; logTail?: string; costUsd: number | undefined; durationMs: number },
@@ -186,7 +247,8 @@ export function finalNoticeDoc(
   notice:
     | { kind: 'pr'; url: string; draft: boolean }
     | { kind: 'no_changes' }
-    | { kind: 'failed'; reason: string },
+    | { kind: 'failed'; reason: string }
+    | { kind: 'declined'; reason: string },
 ): Doc {
   const lead = mentionOf(ctx.requester ?? ctx.ticket.reporter);
   switch (notice.kind) {
@@ -217,6 +279,13 @@ export function finalNoticeDoc(
         paragraph(
           ...lead,
           text(`Lockkeeper stopped: ${notice.reason} The status comment has the details.`),
+        ),
+      ];
+    case 'declined':
+      return [
+        paragraph(
+          ...lead,
+          text(`Lockkeeper will not build this ticket as written: ${notice.reason}`),
         ),
       ];
   }

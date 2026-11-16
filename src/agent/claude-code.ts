@@ -63,6 +63,8 @@ export class ClaudeCodeAdapter implements AgentAdapter {
     ];
     if (invocation.model) args.push('--model', invocation.model);
     args.push('--disallowedTools', 'WebFetch', 'WebSearch');
+    // Best effort: Lockkeeper also resets the checkout after a read-only pass.
+    if (invocation.readOnly) args.push('Edit', 'Write', 'NotebookEdit');
     return `${args.map(shellQuote).join(' ')} < ${shellQuote(invocation.promptFile)}`;
   }
 

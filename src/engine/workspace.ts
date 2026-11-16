@@ -92,6 +92,26 @@ export async function cloneRepo(
   }
 }
 
+/** Put the checkout back to a commit, removing every change and untracked file. */
+export async function resetCheckout(
+  sandbox: SandboxHandle,
+  layout: Layout,
+  sha: string,
+): Promise<void> {
+  if (!isObjectId(sha)) throw new Error(`Invalid commit: ${sha}`);
+  const result = await sandbox.exec(
+    `git checkout --quiet --force --detach ${sha} && git reset --quiet --hard ${sha} && git clean -fdxq && git status --porcelain`,
+    { cwd: layout.repo, timeoutMs: 60_000 },
+  );
+  if (result.exitCode !== 0 || result.stdout.trim() !== '') {
+    throw new StepFailedError(
+      'readiness',
+      'Lockkeeper could not undo what the readiness check changed in the checkout.',
+      tail(result.stderr || result.stdout),
+    );
+  }
+}
+
 /** Where two commits' histories meet: the point a pull request branch forked from. */
 export async function mergeBase(
   sandbox: SandboxHandle,
@@ -200,7 +220,8 @@ export interface AgentFiles {
   pid: string;
 }
 
-export function agentFiles(layout: Layout, round: number): AgentFiles {
+/** Files for one agent invocation: a fix round's number, or a named pass such as `readiness`. */
+export function agentFiles(layout: Layout, round: number | string): AgentFiles {
   const dir = `${layout.work}/agent-${round}`;
   return {
     dir,

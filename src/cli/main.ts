@@ -126,6 +126,19 @@ function printResult(result: RunResult): void {
     case 'refused':
       out(`Not started: ${result.reason}`);
       break;
+    case 'needs_info':
+      out('The readiness check asked questions on the ticket:');
+      for (const [index, question] of result.questions.entries())
+        out(`  ${index + 1}. ${question}`);
+      out(
+        result.run.state === 'needs_info'
+          ? 'Reply `/agent go` there with the answers, or run this command again once the ticket has them.'
+          : 'This was a dry run, so nothing was posted.',
+      );
+      break;
+    case 'declined':
+      out(`Declined by the readiness check: ${result.reason}`);
+      break;
     case 'detached':
       out(
         `Stopped in the ${result.run.state} step. Run the same command again to continue where it left off.`,

@@ -779,3 +779,137 @@ describe('retrying a ticket', () => {
     expect(h.scm.commits).toHaveLength(1);
   });
 });
+
+describe('the readiness check', () => {
+  let h: Harness | undefined;
+
+  afterEach(async () => {
+    if (!h) return;
+    await waitForAgents(h.sandboxes.sandboxes);
+    h.store.close();
+    rmSync(h.root, { recursive: true, force: true });
+    h = undefined;
+  });
+
+  const READY = `${VERIFY}\nreadiness:\n  enabled: true\n`;
+  const verdict = (value: object) =>
+    `Looked at the code.\n<lockkeeper-readiness>\n${JSON.stringify(value)}\n</lockkeeper-readiness>`;
+  const ASK = verdict({
+    verdict: 'needs_info',
+    questions: ['Which file should hold the greeting?', 'Should it end with a full stop?'],
+    reason: 'The ticket does not say where the greeting goes.',
+  });
+
+  function setRounds(harness: Harness, rounds: AgentStep[]): void {
+    writeFileSync(join(harness.root, 'agent-script.json'), JSON.stringify({ rounds }));
+  }
+
+  function callIn(harness: Harness, sandbox: number, round = 0): AgentCall {
+    const home = harness.sandboxes.sandboxes[sandbox]?.homeDir ?? '';
+    const file = join(home, `.fake-agent-call-${round}.json`);
+    return JSON.parse(readFileSync(file, 'utf8')) as AgentCall;
+  }
+
+  it('asks numbered questions, waits without a sandbox, then continues with the answers', async () => {
+    h = harness({ config: READY, rounds: [{ text: ASK }] });
+    const asked = await runTicket(h.deps, { ticketKey: 'DEMO-1', triggeredBy: 'test' });
+
+    expect(asked.outcome).toBe('needs_info');
+    expect(asked.run.state).toBe('needs_info');
+    const [status, questions] = h.comments();
+    expect(status).toContain('waiting for answers');
+    expect(questions).toContain('@Maria');
+    expect(questions).toContain('Which file should hold the greeting?');
+    expect(questions).toContain('/agent go');
+    expect(h.tracker.writes).toContainEqual({
+      action: 'updateLabels',
+      key: 'DEMO-1',
+      change: { add: ['agent-needs-info'], remove: ['agent-working'] },
+    });
+    expect(h.sandbox().destroyed).toBe(true);
+    const check = callIn(h, 0);
+    expect(check.prompt).toContain('Check whether Jira ticket DEMO-1 is ready to build.');
+    expect(check.args).toEqual(expect.arrayContaining(['--disallowedTools', 'Edit', 'Write']));
+    expect(h.scm.commits).toHaveLength(0);
+
+    // What the service records for `/agent go`, then the run continues.
+    setRounds(h, [{ writes: { 'hello.txt': 'hello\n' }, text: report() }]);
+    h.store.appendEvent(asked.run.id, 'answers', { by: 'Maria', text: 'hello.txt, and yes.' });
+    h.store.updateRun(asked.run.id, { state: 'queued', startedAt: null });
+    const done = await resumeRun(h.deps, asked.run.id);
+
+    expect(done?.outcome).toBe('pr');
+    expect(h.sandboxes.sandboxes).toHaveLength(2);
+    const work = callIn(h, 1);
+    expect(work.prompt).toContain(
+      'Before this run, Lockkeeper asked:\n1. Which file should hold the greeting?\n2. Should it end with a full stop?',
+    );
+    expect(work.prompt).toContain('<answers>\nhello.txt, and yes.\n</answers>');
+    // The check's cost counts toward the run: $0.25 for each agent session.
+    expect(done?.run.costUsd).toBe(0.5);
+  });
+
+  it('lets the command line continue a run waiting for answers', async () => {
+    h = harness({ config: READY, rounds: [{ text: ASK }] });
+    await runTicket(h.deps, { ticketKey: 'DEMO-1', triggeredBy: 'test' });
+    setRounds(h, [{ writes: { 'hello.txt': 'hello\n' }, text: report() }]);
+    const done = await runTicket(h.deps, { ticketKey: 'DEMO-1', triggeredBy: 'cli:eugen' });
+    expect(done.outcome).toBe('pr');
+    expect(callIn(h, 1).prompt).toContain('cli:eugen replied with /agent go');
+  });
+
+  it('declines with a reason and does not start the work', async () => {
+    h = harness({
+      config: READY,
+      rounds: [
+        {
+          text: verdict({ verdict: 'declined', reason: 'This asks a question, not for a change.' }),
+        },
+      ],
+    });
+    const result = await runTicket(h.deps, { ticketKey: 'DEMO-1', triggeredBy: 'test' });
+
+    expect(result.outcome).toBe('declined');
+    expect(result.run.state).toBe('declined');
+    const [status, notice] = h.comments();
+    expect(status).toContain('declined');
+    expect(status).toContain('This asks a question, not for a change.');
+    expect(notice).toContain('@Maria');
+    expect(h.scm.commits).toHaveLength(0);
+    expect(h.sandbox().destroyed).toBe(true);
+  });
+
+  it('throws away whatever the check changed before the work starts', async () => {
+    h = harness({
+      config: READY,
+      rounds: [
+        {
+          writes: { 'notes.txt': 'scratch\n' },
+          text: verdict({ verdict: 'ready', plan: 'Add it.' }),
+        },
+        { writes: { 'hello.txt': 'hello\n' }, text: report() },
+      ],
+    });
+    const result = await runTicket(h.deps, { ticketKey: 'DEMO-1', triggeredBy: 'test' });
+
+    expect(result.outcome).toBe('pr');
+    expect(h.scm.commits[0]?.changes.map((change) => change.path)).toEqual(['hello.txt']);
+    expect(h.store.latestEvent(result.run.id, 'readiness')).toMatchObject({
+      verdict: 'ready',
+      plan: 'Add it.',
+    });
+  });
+
+  it('goes ahead when the check gives no verdict', async () => {
+    h = harness({
+      config: READY,
+      rounds: [
+        { text: 'I could not decide.' },
+        { writes: { 'hello.txt': 'hello\n' }, text: report() },
+      ],
+    });
+    const result = await runTicket(h.deps, { ticketKey: 'DEMO-1', triggeredBy: 'test' });
+    expect(result.outcome).toBe('pr');
+    expect(h.store.latestEvent(result.run.id, 'readiness')).toMatchObject({ verdict: 'unclear' });
+  });
+});

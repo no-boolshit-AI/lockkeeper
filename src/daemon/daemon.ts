@@ -242,11 +242,12 @@ export class Daemon {
       const ticketLabels = current.get(run.ticketKey);
       const labelled =
         ticketLabels === undefined ||
-        run.state === 'needs_info' ||
         ticketLabels.includes(labels.working) ||
-        ticketLabels.includes(labels.trigger);
+        ticketLabels.includes(labels.trigger) ||
+        (run.state === 'needs_info' && ticketLabels.includes(labels.needs_info));
       if (!labelled) {
-        await this.stopRun(run, `The ${labels.working} label was removed, so Lockkeeper stopped.`);
+        const removed = run.state === 'needs_info' ? labels.needs_info : labels.working;
+        await this.stopRun(run, `The ${removed} label was removed, so Lockkeeper stopped.`);
         continue;
       }
       await this.readCommands(run);
@@ -409,6 +410,19 @@ export class Daemon {
         await this.stopRun(run, `${comment.author.displayName} stopped the run with /agent stop.`);
         return;
       }
+      if (command.kind === 'go' && run.state === 'needs_info') {
+        // R2: continue with the answers. The time limit starts again from here.
+        const now = new Date(this.now());
+        store.appendEvent(
+          run.id,
+          'answers',
+          { by: comment.author.displayName, text: command.text, commentId: comment.id },
+          now,
+        );
+        store.updateRun(run.id, { state: 'queued', startedAt: null }, now);
+        this.log.step(`${run.ticketKey}: ${comment.author.displayName} answered with /agent go`);
+        return;
+      }
     }
   }
 
@@ -509,6 +523,12 @@ export class Daemon {
         this.log.warn(
           `${key}: ${result.run.state === 'cancelled' ? 'stopped' : 'failed'}. ${result.error.message}`,
         );
+        break;
+      case 'needs_info':
+        this.log.step(`${key}: asked ${result.questions.length} questions on the ticket`);
+        break;
+      case 'declined':
+        this.log.warn(`${key}: declined. ${result.reason}`);
         break;
       case 'detached':
         break;

@@ -147,6 +147,15 @@ export const configSchema = z.object({
       verify_minutes: z.number().int().positive().default(15),
     })
     .prefault({}),
+  /** R1: a short read-only pass that decides whether a ticket can be built as written. */
+  readiness: z
+    .object({
+      enabled: z.boolean().default(true),
+      cost_usd: z.number().positive().default(1),
+      turns: z.number().int().positive().default(25),
+      minutes: z.number().int().positive().default(10),
+    })
+    .prefault({}),
   repo: repoSettings.prefault({}),
   store: z.object({ path: z.string().min(1).default('.lockkeeper/lockkeeper.db') }).prefault({}),
 });

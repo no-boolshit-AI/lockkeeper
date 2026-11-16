@@ -31,25 +31,32 @@ import { allowList } from './domains.js';
 import {
   type AgentReport,
   buildFixPrompt,
+  buildReadinessPrompt,
+  buildReadinessSystemPrompt,
   buildSystemPrompt,
   buildTaskPrompt,
   type InstructionFile,
   matchCriteria,
   parseAgentReport,
+  parseReadiness,
+  type Readiness,
   stripReport,
 } from './prompts.js';
 import {
   capPullRequestBody,
   cleanAgentText,
+  declinedDoc,
   failedDoc,
   finalNoticeDoc,
   noChangesDoc,
   pickedUpDoc,
   progressDoc,
   pullRequestBodyDoc,
+  questionsDoc,
   type RunContext,
   refusedDoc,
   resultDoc,
+  waitingDoc,
 } from './report.js';
 import {
   agentFiles,
@@ -63,6 +70,7 @@ import {
   layoutFor,
   mergeBase,
   readInstructionFiles,
+  resetCheckout,
   runCommands,
   type StopRequest,
   startAgent,
@@ -123,7 +131,9 @@ export type RunResult =
   | { outcome: 'refused'; run: RunRecord; reason: string }
   | { outcome: 'failed'; run: RunRecord; error: Error }
   | { outcome: 'dry_run'; run: RunRecord; preview: DryRunPreview }
-  | { outcome: 'detached'; run: RunRecord };
+  | { outcome: 'detached'; run: RunRecord }
+  | { outcome: 'needs_info'; run: RunRecord; questions: string[] }
+  | { outcome: 'declined'; run: RunRecord; reason: string };
 
 const PLACEHOLDER_KEY = 'lockkeeper-key-added-by-egress-proxy';
 const MAX_SANDBOX_MS = 60 * 60_000;
@@ -207,7 +217,7 @@ const leaseEnd = (now: number) => new Date(now + LEASE_MS);
 function activeHint(run: RunRecord): string {
   switch (run.state) {
     case 'needs_info':
-      return `It is waiting for answers on the ticket. Reply \`/agent go\` there, or run \`lockkeeper cancel ${run.ticketKey}\`.`;
+      return `It is waiting for answers on the ticket. Reply \`/agent go\` there, run \`lockkeeper run ${run.ticketKey}\` once the ticket has them, or run \`lockkeeper cancel ${run.ticketKey}\`.`;
     case 'in_review':
       return `Its pull request is in review. Run \`lockkeeper cancel ${run.ticketKey}\` to release the ticket.`;
     case 'queued':
@@ -233,6 +243,14 @@ export async function runTicket(deps: RunDeps, request: RunRequest): Promise<Run
   const nowMs = (deps.now ?? Date.now)();
   const now = new Date(nowMs);
   const active = deps.store.activeRunFor(key);
+  if (active?.state === 'needs_info' && !request.dryRun) {
+    deps.store.appendEvent(active.id, 'answers', { by: request.triggeredBy, text: '' }, now);
+    deps.store.updateRun(active.id, { state: 'queued', startedAt: null }, now);
+    if (deps.store.acquireLease(active.id, PROCESS_OWNER, leaseEnd(nowMs), now)) {
+      const requeued = deps.store.getRun(active.id) as RunRecord;
+      return new TicketRun(deps, { ...request, ticketKey: key }, requeued, settings).execute();
+    }
+  }
   if (active) {
     const orphaned =
       isExecuting(active.state) &&
@@ -347,6 +365,8 @@ class TicketRun {
   private costUsd: number | undefined;
   private turns: number | undefined;
   private fixRounds: number;
+  /** What earlier agent sessions of this run cost, such as the readiness check. */
+  private priorCostUsd: number;
   private leaseLost = false;
 
   constructor(
@@ -362,6 +382,9 @@ class TicketRun {
     this.costUsd = run.costUsd ?? undefined;
     this.turns = run.turns ?? undefined;
     this.fixRounds = run.fixRounds ?? 0;
+    this.priorCostUsd = deps.store
+      .events(run.id, { kind: 'readiness' })
+      .reduce((sum, event) => sum + ((event.data as { costUsd?: number }).costUsd ?? 0), 0);
     // The time limit counts from the run's first start, including any time it was stopped.
     this.startedAt = run.startedAt ? Date.parse(run.startedAt) : this.now();
     this.deadline = this.startedAt + deps.config.limits.minutes * 60_000;
@@ -401,7 +424,8 @@ class TicketRun {
     } else {
       this.restore();
     }
-    await this.prepare();
+    const early = await this.prepare();
+    if (early) return early;
     const work = await this.implementAndVerify();
     if ('outcome' in work) return work;
     return await this.collectAndPublish(work);
@@ -468,7 +492,7 @@ class TicketRun {
   }
 
   /** Sandbox (E1, E2, E3), clone and setup (E6), or reconnect to a prepared sandbox. */
-  private async prepare(): Promise<void> {
+  private async prepare(): Promise<RunResult | undefined> {
     const { config, scm, sandboxes, agent } = this.deps;
     const key = this.run.ticketKey;
     if (this.run.sandboxId && this.run.baseSha && PREPARED.has(this.run.state)) {
@@ -576,6 +600,10 @@ class TicketRun {
     );
     this.checkCancelled();
 
+    // R1: decide whether the ticket can be built before spending on setup and code.
+    const verdict = await this.readiness();
+    if (verdict) return verdict;
+
     // Setup (E6)
     this.setState('setup');
     let setup = this.settings.setup;
@@ -610,6 +638,168 @@ class TicketRun {
       }
     }
     this.checkCancelled();
+  }
+
+  /**
+   * R1: a read-only agent pass that decides whether the ticket can be built as written.
+   * It has its own small cap, and anything it changes is thrown away. People who
+   * answered its questions or asked for a retry already said go, so it is skipped then.
+   */
+  private async readiness(): Promise<RunResult | undefined> {
+    const { config, agent, modelKey } = this.deps;
+    if (!config.readiness.enabled || this.answers() || this.run.parentRunId) return undefined;
+    const budget = Math.min(
+      config.readiness.cost_usd,
+      config.limits.cost_usd - (this.costUsd ?? 0),
+    );
+    if (budget < 0.01) return undefined;
+    const sandbox = this.sandbox as SandboxHandle;
+    const layout = this.layout as Layout;
+    const base = this.base as BaseRef;
+    const ticket = this.ticket as TicketSnapshot;
+    const ctx = this.context();
+    const started = this.now();
+    this.setState('readiness');
+    this.log.step('Checking that the ticket is ready to build');
+    await this.progress(ctx, 'the agent is checking that the ticket is ready to build');
+
+    const files = agentFiles(layout, 'readiness');
+    const system = buildReadinessSystemPrompt({
+      workdir: layout.repo,
+      instructions: this.instructions,
+    });
+    const prompt = buildReadinessPrompt(ticket);
+    await sandbox.exec(`mkdir -p '${files.dir}'`, { timeoutMs: 30_000 });
+    await sandbox.writeFile(files.system, system);
+    await sandbox.writeFile(files.prompt, prompt);
+    const command = agent.command({
+      workdir: layout.repo,
+      promptFile: files.prompt,
+      systemPromptFile: files.system,
+      sessionId: randomUUID(),
+      resume: false,
+      maxTurns: config.readiness.turns,
+      maxBudgetUsd: budget,
+      readOnly: true,
+      ...(config.agent.model ? { model: config.agent.model } : {}),
+    });
+    const env = {
+      ...agent.environment(this.keyPlacement()),
+      [agent.credential.env]: modelKey.mode === 'env' ? modelKey.value : PLACEHOLDER_KEY,
+    };
+    await startAgent(sandbox, layout, files, command, env);
+    this.audit('readiness_start', { system, prompt, command, budgetUsd: budget });
+    const watch = await watchAgent(sandbox, files, {
+      adapter: agent,
+      onEvent: (event) => this.onAgentEvent(event, -1),
+      deadline: Math.min(this.deadline, this.now() + config.readiness.minutes * 60_000),
+      pollMs: this.deps.pollMs ?? 3_000,
+      keepAliveEveryMs: 60_000,
+      sandboxTimeoutMs: this.sandboxTimeout(),
+      now: this.now,
+      ...(this.deps.sleep ? { sleep: this.deps.sleep } : {}),
+      shouldStop: () => this.stopRequest(),
+    });
+    if (watch.stopped === 'detached') throw new RunDetachedError();
+    if (watch.stopped === 'cancelled')
+      throw new RunCancelledError(cancelReason(this.request.signal));
+
+    const costUsd = watch.result?.costUsd ?? 0;
+    this.priorCostUsd += costUsd;
+    this.costUsd = (this.costUsd ?? 0) + costUsd;
+    // No verdict (a cap, an error) must not block the ticket: go ahead as if ready.
+    const verdict: Readiness | undefined =
+      watch.result?.ok && watch.result.text ? parseReadiness(watch.result.text) : undefined;
+    this.audit('readiness', {
+      verdict: verdict?.verdict ?? 'unclear',
+      questions: verdict?.questions ?? [],
+      reason: verdict?.reason ?? '',
+      plan: verdict?.plan ?? '',
+      costUsd,
+      stopped: watch.stopped,
+      outcome: watch.result?.outcome,
+    });
+    this.update({ costUsd: this.costUsd });
+    // Throw away anything the check changed, so the work starts from a clean checkout.
+    await resetCheckout(sandbox, layout, base.sha);
+    if (!verdict || verdict.verdict === 'ready') {
+      if (!verdict) this.log.warn('The readiness check gave no verdict, so the run goes ahead.');
+      return undefined;
+    }
+    const check = { costUsd, durationMs: this.now() - started };
+    return verdict.verdict === 'needs_info'
+      ? this.askQuestions(ctx, verdict, check)
+      : this.decline(ctx, verdict, check);
+  }
+
+  /** R2: ask in the ticket, then wait without a sandbox until someone says go. */
+  private async askQuestions(
+    ctx: RunContext,
+    verdict: Readiness,
+    check: { costUsd: number; durationMs: number },
+  ): Promise<RunResult> {
+    const key = this.run.ticketKey;
+    const labels = this.deps.config.jira.labels;
+    const questions = verdict.questions.map((question) => cleanAgentText(question, 300));
+    const reason = cleanAgentText(verdict.reason, 300);
+    if (this.statusCommentId)
+      await this.tracker.updateComment(key, this.statusCommentId, waitingDoc(ctx, check));
+    await this.tracker.postComment(
+      key,
+      questionsDoc(ctx, { questions, reason, label: labels.needs_info }),
+    );
+    await this.tracker.updateLabels(key, { add: [labels.needs_info], remove: [labels.working] });
+    await this.sandbox?.destroy();
+    this.sandbox = undefined;
+    this.log.warn(`${key} needs answers before it can be built.`);
+    // A dry run never parks: it only shows what would be asked.
+    this.update({
+      state: this.request.dryRun ? 'done' : 'needs_info',
+      sandboxId: null,
+      costUsd: this.costUsd ?? null,
+      ...(this.request.dryRun ? { finishedAt: new Date(this.now()).toISOString() } : {}),
+    });
+    return { outcome: 'needs_info', run: this.run, questions };
+  }
+
+  private async decline(
+    ctx: RunContext,
+    verdict: Readiness,
+    check: { costUsd: number; durationMs: number },
+  ): Promise<RunResult> {
+    const key = this.run.ticketKey;
+    const reason = cleanAgentText(verdict.reason || 'The readiness check gave no reason.', 500);
+    if (this.statusCommentId)
+      await this.tracker.updateComment(
+        key,
+        this.statusCommentId,
+        declinedDoc(ctx, { reason, ...check }),
+      );
+    await this.tracker.postComment(key, finalNoticeDoc(ctx, { kind: 'declined', reason }));
+    await this.tracker.updateLabels(key, { remove: [this.deps.config.jira.labels.working] });
+    await this.sandbox?.destroy();
+    this.sandbox = undefined;
+    this.log.warn(`Declined: ${reason}`);
+    this.update({
+      state: 'declined',
+      error: reason,
+      finishedAt: new Date(this.now()).toISOString(),
+      costUsd: this.costUsd ?? null,
+    });
+    return { outcome: 'declined', run: this.run, reason };
+  }
+
+  private answers(): { by: string; text: string } | undefined {
+    return this.deps.store.latestEvent<{ by: string; text: string }>(this.run.id, 'answers');
+  }
+
+  private answersForPrompt(): { answers?: { questions: string[]; text: string; by: string } } {
+    const answers = this.answers();
+    if (!answers) return {};
+    const asked = this.deps.store.latestEvent<{ questions?: string[] }>(this.run.id, 'readiness');
+    return {
+      answers: { questions: asked?.questions ?? [], text: answers.text, by: answers.by },
+    };
   }
 
   /**
@@ -746,6 +936,7 @@ class TicketRun {
           prompt = buildTaskPrompt(ticket, workflow, {
             ...(this.run.hint ? { hint: this.run.hint } : {}),
             earlierAttempt: this.continuing,
+            ...this.answersForPrompt(),
           });
           this.audit('prompt', { round: 0, system, prompt });
         }
@@ -1191,7 +1382,7 @@ class TicketRun {
     if (watch.stopped === 'detached') throw new RunDetachedError();
     const result = watch.result;
     // Cost is the session total so far; turns are this round's only (see AgentEvent).
-    if (result?.costUsd !== undefined) this.costUsd = result.costUsd;
+    if (result?.costUsd !== undefined) this.costUsd = this.priorCostUsd + result.costUsd;
     if (result?.turns !== undefined) this.turns = (this.turns ?? 0) + result.turns;
     this.audit('agent_exit', {
       round,

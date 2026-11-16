@@ -52,6 +52,8 @@ export interface AgentInvocation {
   maxTurns: number;
   /** Spending cap for this invocation, not counting earlier rounds of the session. */
   maxBudgetUsd: number;
+  /** A pass that must not change files, such as the readiness check. */
+  readOnly?: boolean;
 }
 
 export interface KeyPlacement {
