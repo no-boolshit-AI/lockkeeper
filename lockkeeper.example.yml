@@ -1,0 +1,72 @@
+# Lockkeeper configuration. Copy to lockkeeper.yml and edit.
+# Credentials never go in this file: put them in the environment or in
+# .lockkeeper/.env next to it (see README.md).
+
+jira:
+  site: acme.atlassian.net
+  # The account Lockkeeper acts as. Or set LOCKKEEPER_JIRA_EMAIL.
+  # email: lockkeeper-bot@acme.com
+  trigger: "labels = agent"
+  labels:
+    trigger: agent
+    working: agent-working
+    needs_info: agent-needs-info
+    in_review: agent-in-review
+    failed: agent-failed
+  # Who may trigger runs (used by the label trigger in M2): emails, account IDs or groups.
+  allow_users: [maria@acme.com, tech-leads]
+  # Tickets with text from external (customer) accounts are refused unless allowed.
+  allow_external: false
+  # A custom field holding acceptance criteria. Detected by name when unset.
+  # acceptance_criteria_field: Acceptance Criteria
+  # transitions:
+  #   in_review: In Review
+
+github:
+  # The GitHub App Lockkeeper acts as. Or set LOCKKEEPER_GITHUB_APP_ID.
+  # app_id: 123456
+  # private_key_path: .lockkeeper/github-app.pem
+
+projects:
+  SHOP:
+    repo: acme/shop
+    base_branch: main
+    # A component or label on the ticket can point it at another repository.
+    # components:
+    #   Payments: acme/payments
+    # labels:
+    #   repo-web: acme/web
+    # Per-project overrides of the repo block below:
+    # verify: [npm run lint, npm test]
+
+agent:
+  use: claude-code
+  # model: claude-opus-5-5
+  # Pin the Claude Code version installed in the sandbox:
+  # version: 2.1.325
+  # egress: the model key is an E2B secret added outside the sandbox (run `lockkeeper secrets sync`).
+  # env: the key is passed into the agent's environment, for accounts without E2B secrets.
+  key_injection: egress
+  secret_name: lockkeeper-anthropic-api-key
+
+sandbox:
+  provider: e2b
+  # template: claude
+  # Hosts the sandbox may reach on top of the model API, GitHub and package registries.
+  allow_domains: []
+
+limits:
+  cost_usd: 10
+  minutes: 45
+  turns: 150
+  fix_rounds: 2
+  max_added_lines: 500
+  max_changed_files: 60
+  parallel_runs: 3
+
+# Commands run in the repository. Left out, they are detected from the repository.
+repo:
+  setup: npm ci
+  verify: [npm run lint, npm test]
+  # Changes here keep the PR in draft. Left out, a broader default list applies.
+  # protected_paths: ['.github/**', 'CODEOWNERS', 'AGENTS.md']
