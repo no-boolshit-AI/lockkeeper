@@ -12,7 +12,21 @@ export type AgentCommand =
   | { kind: 'go'; text: string }
   | { kind: 'unknown'; word: string };
 
-const COMMAND = /^\/agent(?:\s+([A-Za-z-]+))?\b[ \t]*([\s\S]*)$/;
+// Closing marks may follow `/agent` itself, as in **/agent** stop.
+const COMMAND = /^\/agent[`*_]*(?:\s+([A-Za-z-]+))?\b[ \t]*([\s\S]*)$/;
+
+/**
+ * Commands on a pull request (F1). `/agent stop` stops a follow-up in progress. Any
+ * other `/agent <text>` asks for a follow-up, and the whole comment is the request.
+ */
+export type PullRequestCommand = { kind: 'stop' } | { kind: 'request' };
+
+export function parsePullRequestCommand(body: string): PullRequestCommand | undefined {
+  const start = body.trimStart().replace(/^[`*_>\s]+/, '');
+  if (!/^\/agent\b/i.test(start)) return undefined;
+  const command = parseCommand(`/agent${start.slice('/agent'.length)}`);
+  return command?.kind === 'stop' ? { kind: 'stop' } : { kind: 'request' };
+}
 
 export function parseCommand(body: string): AgentCommand | undefined {
   // Jira's rich text may wrap the command in code, bold or quote marks.

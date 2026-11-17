@@ -11,7 +11,7 @@ Dates assume work started on 16 November 2026 with one or two engineers, as the 
 | M0 Foundation | (none) | 17 Nov 2026 | Repository, toolchain, CI, licence, the four extension interfaces, config schema | CI green on `main` | Done |
 | M1 Walking skeleton | Weeks 1-2 | 29 Nov 2026 | `lockkeeper run PROJ-1` turns a ticket into a draft PR and a Jira comment, using Claude Code in an E2B sandbox | A demo ticket becomes a draft PR in under 15 minutes | Exit gate met on 16 Nov 2026 |
 | M2 Private alpha | Weeks 3-6 | 27 Dec 2026 | Label trigger, readiness check, caps, verification, `init` and `doctor`, with three to five design partners | 20 real tickets across 3 teams, at least half merged | In progress |
-| M3 Public beta | Weeks 7-10 | 24 Jan 2027 | Review follow-ups, pause and resume, Codex CLI and OpenCode adapters, `demo`, run page, Docker image, security docs | Five fresh installs each reach a first PR in under 15 minutes | Not started |
+| M3 Public beta | Weeks 7-10 | 24 Jan 2027 | Review follow-ups, pause and resume, Codex CLI and OpenCode adapters, `demo`, run page, Docker image, security docs | Five fresh installs each reach a first PR in under 15 minutes | In progress |
 | M4 1.0 | Weeks 11-14 | 21 Feb 2027 | Hardening, evaluation suite, upgrade path, contribution guide | No open critical security finding, and the merge-rate target met at design partners | Not started |
 
 M2 runs over the year-end holidays. If design partners are slow to start, the M2 gate slips first. Build work should not wait for them.
@@ -68,7 +68,7 @@ Known gaps to close in M2:
 - Allowing any domain on E2B also opens its DNS resolver.
 - The sandbox user has passwordless sudo.
 - GitHub stays reachable while the agent works unless `sandbox.close_github_after_setup` is set. Package registries stay open, so a hijacked agent could still publish to one with credentials planted in a ticket; the PR flags any outside host its commands named.
-- Paused sandboxes stay until the cleanup planned for M3.
+- Paused sandboxes stay until the cleanup planned for M3. (Done in M3.)
 
 ## M2 Private alpha (weeks 3-6)
 
@@ -113,15 +113,18 @@ Notes for later:
 
 Goal: anyone can install it alone and stay in GitHub for review.
 
-- Review feedback: a changes-requested review, or a `/agent` comment from a user with write access, resumes the same sandbox and session; a fresh sandbox continues from the branch when it cannot (F1)
-- Pause the sandbox when the PR opens; delete it on merge, close or 14 idle days (F2)
-- Automatic CI fix rounds, two at most (P1)
-- Codex CLI and OpenCode adapters, plus adapter conformance tests (P1)
-- `demo` command with a sample repository (P1)
-- Local run page with live log, diff and cost (P1)
-- Docker image, npm releases, signed release artefacts
-- Security docs: threat model, data-flow page naming every party, permission list with a reason for each, troubleshooting keyed to `doctor` output
-- Baseline test run on the base branch, cap on open agent PRs per repository, daily run cap (P1)
+| Workstream | Requirements | Status |
+| --- | --- | --- |
+| Review feedback: a changes-requested review, or a `/agent` comment from a user with write access, resumes the same sandbox and session; a fresh sandbox continues from the branch when it cannot | F1 | Done. Two rounds per PR by default; the reply goes on the PR, and `/agent stop` there stops a follow-up |
+| Pause the sandbox when the PR opens; delete it on merge, close or 14 idle days | F2 | Done. Merges close out the ticket's status comment; a sweep deletes sandboxes no run holds |
+| Automatic CI fix rounds, two at most | P1 | Done. Only on Lockkeeper's own commit, and not for checks that also fail on the base branch |
+| Codex CLI and OpenCode adapters, plus adapter conformance tests | P1 | Not started |
+| `demo` command with a sample repository | P1 | Not started |
+| Local run page with live log, diff and cost | P1 | Not started |
+| Docker image, npm releases, signed release artefacts | O2 | Not started |
+| Security docs: threat model, data-flow page naming every party, permission list with a reason for each, troubleshooting keyed to `doctor` output | 1.0 assets | Not started |
+| Baseline test run on the base branch | P1 | Not started |
+| Cap on open agent PRs per repository, daily run cap | P1 | Done. Runs over a cap wait in the queue and say why on the ticket |
 
 Exit gate: five fresh installs each reach a first PR in under 15 minutes.
 

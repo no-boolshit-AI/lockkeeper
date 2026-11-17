@@ -26,7 +26,15 @@ export class AlreadyActiveError extends LockkeeperError {
   }
 }
 
-export type CapName = 'cost' | 'minutes' | 'turns' | 'fix_rounds' | 'diff_size' | 'parallel_runs';
+export type CapName =
+  | 'cost'
+  | 'minutes'
+  | 'turns'
+  | 'fix_rounds'
+  | 'diff_size'
+  | 'parallel_runs'
+  | 'runs_per_day'
+  | 'open_prs_per_repo';
 
 /** A per-run or per-install cap was hit (E7). The cap is named on the ticket. */
 export class CapExceededError extends LockkeeperError {

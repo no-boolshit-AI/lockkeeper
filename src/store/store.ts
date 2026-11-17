@@ -54,6 +54,21 @@ export function isExecuting(state: RunState): boolean {
   return EXECUTING_STATES.includes(state);
 }
 
+/**
+ * Why a run exists: a ticket picked up for the first time (from a label or the CLI), a
+ * `/agent retry` on the ticket, review feedback on its pull request (F1), or failed CI
+ * checks on it.
+ */
+export const RUN_KINDS = ['ticket', 'retry', 'review', 'ci'] as const;
+export type RunKind = (typeof RUN_KINDS)[number];
+
+/** Runs that add to an open pull request because of something said or seen on it. */
+export function isFollowUp(kind: RunKind): boolean {
+  return kind === 'review' || kind === 'ci';
+}
+
+export type PullRequestState = 'open' | 'merged' | 'closed';
+
 export interface RunRecord {
   id: string;
   ticketKey: string;
@@ -97,6 +112,11 @@ export interface RunRecord {
   parentRunId: string | null;
   /** Extra guidance for the agent, from `/agent retry`. */
   hint: string | null;
+  kind: RunKind;
+  /** The pull request's state as last seen. Null until the run opens or inherits one. */
+  prState: PullRequestState | null;
+  /** JSON: the newest pull request feedback already acted on (F1). */
+  prSeen: string | null;
 }
 
 export type NewRun = Pick<
@@ -116,6 +136,14 @@ export type NewRun = Pick<
       | 'parentRunId'
       | 'hint'
       | 'branch'
+      | 'kind'
+      | 'prNumber'
+      | 'prUrl'
+      | 'prState'
+      | 'prSeen'
+      | 'sandboxId'
+      | 'sessionId'
+      | 'statusCommentId'
     >
   >;
 
@@ -166,6 +194,9 @@ const COLUMNS: Record<keyof RunRecord, string> = {
   commentsSeen: 'comments_seen',
   parentRunId: 'parent_run_id',
   hint: 'hint',
+  kind: 'kind',
+  prState: 'pr_state',
+  prSeen: 'pr_seen',
 };
 
 const sqlList = (states: readonly RunState[]) => states.map((state) => `'${state}'`).join(', ');
@@ -230,6 +261,16 @@ export const MIGRATIONS: readonly string[] = [
   CREATE UNIQUE INDEX runs_one_active_per_ticket ON runs (ticket_key)
     WHERE state NOT IN ('done', 'failed', 'cancelled', 'refused', 'declined');
   CREATE INDEX runs_state ON runs (state);
+  `,
+  // M3: follow-ups on pull requests (F1), and their clean-up (F2).
+  `
+  ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'ticket';
+  ALTER TABLE runs ADD COLUMN pr_state TEXT;
+  ALTER TABLE runs ADD COLUMN pr_seen TEXT;
+  UPDATE runs SET kind = 'retry' WHERE trigger_info LIKE '%"source":"retry"%';
+  UPDATE runs SET pr_state = 'open' WHERE pr_number IS NOT NULL;
+  CREATE INDEX runs_sandbox_id ON runs (sandbox_id);
+  CREATE INDEX runs_ticket_created ON runs (ticket_key, created_at);
   `,
 ];
 
@@ -322,7 +363,15 @@ export class Store {
       commentsSeen: input.commentsSeen ?? null,
       parentRunId: input.parentRunId ?? null,
       hint: input.hint ?? null,
+      kind: input.kind ?? 'ticket',
+      prState: input.prState ?? null,
+      prSeen: input.prSeen ?? null,
     };
+    if (input.prNumber !== undefined) record.prNumber = input.prNumber;
+    if (input.prUrl !== undefined) record.prUrl = input.prUrl;
+    if (input.sandboxId !== undefined) record.sandboxId = input.sandboxId;
+    if (input.sessionId !== undefined) record.sessionId = input.sessionId;
+    if (input.statusCommentId !== undefined) record.statusCommentId = input.statusCommentId;
     const columns = Object.values(COLUMNS);
     const params: Row = {};
     for (const [key, column] of Object.entries(COLUMNS)) {
@@ -342,6 +391,23 @@ export class Store {
       throw error;
     }
     return record;
+  }
+
+  /**
+   * Hand a ticket from one run to the next in one transaction: the earlier run is
+   * closed with `previous` and the new one created, or neither happens.
+   */
+  supersede(previousId: string, previous: RunPatch, input: NewRun, now = new Date()): RunRecord {
+    this.db.exec('BEGIN');
+    try {
+      this.updateRun(previousId, previous, now);
+      const run = this.createRun(input, now);
+      this.db.exec('COMMIT');
+      return run;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   getRun(id: string): RunRecord | undefined {
@@ -382,6 +448,58 @@ export class Store {
       )
       .all(since.toISOString()) as Row[];
     return rows.map(toRecord);
+  }
+
+  /**
+   * The newest run of each ticket whose pull request is open, whatever the run's state:
+   * the runs whose pull requests Lockkeeper watches for merges, reviews and CI (F1, F2).
+   */
+  pullRequestRuns(): RunRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM runs r WHERE r.pr_number IS NOT NULL AND r.pr_state = 'open' AND r.dry_run = 0
+           AND r.created_at = (SELECT MAX(x.created_at) FROM runs x WHERE x.ticket_key = r.ticket_key)
+         ORDER BY r.updated_at`,
+      )
+      .all() as Row[];
+    return rows.map(toRecord);
+  }
+
+  /** Follow-up runs of one kind on a pull request, for the round limits (F1). */
+  countFollowUps(ticketKey: string, prNumber: number, kind: RunKind): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM runs WHERE ticket_key = ? AND pr_number = ? AND kind = ? AND state != 'refused'`,
+      )
+      .get(ticketKey, prNumber, kind) as { n: number };
+    return row.n;
+  }
+
+  /** Runs that hold this sandbox, so a clean-up never deletes one still in use. */
+  runsUsingSandbox(sandboxId: string): RunRecord[] {
+    const rows = this.db
+      .prepare('SELECT * FROM runs WHERE sandbox_id = ? ORDER BY created_at')
+      .all(sandboxId) as Row[];
+    return rows.map(toRecord);
+  }
+
+  /** Runs that started working at or after `since`, for the daily run cap. */
+  countStartedSince(since: Date): number {
+    const row = this.db
+      .prepare('SELECT COUNT(*) AS n FROM runs WHERE started_at >= ? AND dry_run = 0')
+      .get(since.toISOString()) as { n: number };
+    return row.n;
+  }
+
+  /** Open pull requests Lockkeeper made in a repository, for the open-PR cap. */
+  countOpenPullRequests(repo: string): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM runs r WHERE r.repo = ? AND r.pr_number IS NOT NULL AND r.pr_state = 'open' AND r.dry_run = 0
+           AND r.created_at = (SELECT MAX(x.created_at) FROM runs x WHERE x.ticket_key = r.ticket_key)`,
+      )
+      .get(repo) as { n: number };
+    return row.n;
   }
 
   /** Every run that still owns its ticket, oldest first. */

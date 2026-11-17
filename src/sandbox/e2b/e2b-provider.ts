@@ -5,6 +5,7 @@ import type {
   SandboxHandle,
   SandboxProvider,
   SandboxSpec,
+  SandboxSummary,
   SecretBinding,
 } from '../sandbox.js';
 
@@ -49,6 +50,31 @@ export class E2BProvider implements SandboxProvider {
 
   async connect(id: string): Promise<SandboxHandle> {
     return new E2BSandbox(await Sandbox.connect(id, { apiKey: this.options.apiKey }));
+  }
+
+  async deleteSandbox(id: string): Promise<boolean> {
+    return Sandbox.kill(id, { apiKey: this.options.apiKey });
+  }
+
+  async listSandboxes(metadataKey: string): Promise<SandboxSummary[]> {
+    const paginator = Sandbox.list({
+      apiKey: this.options.apiKey,
+      query: { state: ['running', 'paused'] },
+    });
+    const found: SandboxSummary[] = [];
+    // A cap on pages, so a huge account cannot keep a clean-up pass busy forever.
+    for (let page = 0; page < 50 && paginator.hasNext; page++) {
+      for (const info of await paginator.nextItems()) {
+        if (info.metadata?.[metadataKey] === undefined) continue;
+        found.push({
+          id: info.sandboxId,
+          metadata: info.metadata,
+          state: info.state,
+          startedAt: info.startedAt.toISOString(),
+        });
+      }
+    }
+    return found;
   }
 
   /** Store or replace a secret in E2B's secret store. Its value never comes back out. */

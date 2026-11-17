@@ -16,6 +16,7 @@ import type {
   SandboxHandle,
   SandboxProvider,
   SandboxSpec,
+  SandboxSummary,
 } from '../../src/sandbox/sandbox.js';
 
 /**
@@ -34,18 +35,42 @@ export class LocalSandboxProvider implements SandboxProvider {
     private readonly options: { root: string; binDir: string; env?: Record<string, string> },
   ) {}
 
+  /** IDs connected to, in order, so a test can tell a resume from a fresh sandbox. */
+  readonly connects: string[] = [];
+
   async create(spec: SandboxSpec): Promise<SandboxHandle> {
     this.specs.push(spec);
     const home = mkdtempSync(join(this.options.root, 'sandbox-'));
     const sandbox = new LocalSandbox(home, this.options.binDir, this.options.env ?? {});
+    sandbox.metadata = spec.metadata;
     this.sandboxes.push(sandbox);
     return sandbox;
   }
 
   async connect(id: string): Promise<SandboxHandle> {
+    this.connects.push(id);
     const sandbox = this.sandboxes.find((entry) => entry.id === id);
-    if (!sandbox) throw new Error(`No local sandbox ${id}`);
+    if (!sandbox || sandbox.destroyed) throw new Error(`No local sandbox ${id}`);
+    sandbox.paused = false;
     return sandbox;
+  }
+
+  async deleteSandbox(id: string): Promise<boolean> {
+    const sandbox = this.sandboxes.find((entry) => entry.id === id);
+    if (!sandbox || sandbox.destroyed) return false;
+    sandbox.destroyed = true;
+    return true;
+  }
+
+  async listSandboxes(metadataKey: string): Promise<SandboxSummary[]> {
+    return this.sandboxes
+      .filter((sandbox) => !sandbox.destroyed && sandbox.metadata[metadataKey] !== undefined)
+      .map((sandbox) => ({
+        id: sandbox.id,
+        metadata: sandbox.metadata,
+        state: sandbox.paused ? 'paused' : 'running',
+        startedAt: new Date().toISOString(),
+      }));
   }
 }
 
@@ -53,6 +78,7 @@ export class LocalSandbox implements SandboxHandle {
   readonly id: string;
   paused = false;
   destroyed = false;
+  metadata: Record<string, string> = {};
   readonly commands: { command: string; env?: Record<string, string> }[] = [];
   /** Allow-lists set after creation, in order. */
   readonly egress: string[][] = [];

@@ -2,7 +2,7 @@ import type { AgentAdapter } from '../agent/agent.js';
 import { type Config, type ProjectSettings, projectSettings } from '../config/schema.js';
 import { errorMessage, LockkeeperError } from '../core/errors.js';
 import type { SandboxHandle, SandboxProvider, SecretBinding } from '../sandbox/sandbox.js';
-import type { SourceControl } from '../scm/scm.js';
+import { CI_PERMISSIONS, type SourceControl } from '../scm/scm.js';
 import type { Tracker, TrackerAbility } from '../tracker/tracker.js';
 import { detectCommands } from './detect.js';
 import { allowList } from './domains.js';
@@ -141,6 +141,18 @@ export async function runDoctor(
       };
     });
     if (repo.status !== 'ok') continue;
+    if (config.ci.fix_rounds > 0) {
+      await attempt(`CI access in ${settings.repo}`, async () => {
+        const missing = await scm.missingPermissions(settings.repo, CI_PERMISSIONS);
+        return missing.length === 0
+          ? { status: 'ok', detail: 'can read checks, commit statuses and job logs' }
+          : {
+              status: 'warn',
+              detail: `CI fix rounds need ${missing.join(', ')}`,
+              fix: 'Add them in the GitHub App settings and accept them on the installation, or set ci.fix_rounds: 0.',
+            };
+      });
+    }
     await attempt(`Branch rules in ${settings.repo}`, async () => {
       const found = new Set<string>();
       for (const workflow of ['feature', 'bugfix']) {

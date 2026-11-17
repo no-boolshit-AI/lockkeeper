@@ -58,6 +58,11 @@ const repoSettings = z.object({
   protected_paths: z.array(z.string().min(1)).optional(),
 });
 
+const reviewOverrides = z.object({
+  rounds: z.number().int().min(0).max(10).optional(),
+  changes_requested: z.boolean().optional(),
+});
+
 const projectSchema = z.object({
   repo: repoSlug,
   base_branch: z.string().min(1).default('main'),
@@ -70,6 +75,8 @@ const projectSchema = z.object({
   setup: commandList.optional(),
   verify: commandList.optional(),
   protected_paths: z.array(z.string().min(1)).optional(),
+  /** F1: this project's own review settings. */
+  review: reviewOverrides.optional(),
 });
 
 export const configSchema = z.object({
@@ -93,7 +100,13 @@ export const configSchema = z.object({
     poll_seconds: z.number().int().min(10).default(30),
     /** A custom field holding acceptance criteria, by name or ID. Detected when unset. */
     acceptance_criteria_field: z.string().min(1).optional(),
-    transitions: z.object({ in_review: z.string().min(1).optional() }).prefault({}),
+    transitions: z
+      .object({
+        in_review: z.string().min(1).optional(),
+        /** Applied when the pull request merges. */
+        merged: z.string().min(1).optional(),
+      })
+      .prefault({}),
   }),
   github: z
     .object({
@@ -137,6 +150,8 @@ export const configSchema = z.object({
        * model API and package registries. Setup can still fetch git dependencies.
        */
       close_github_after_setup: z.boolean().default(false),
+      /** F2: a paused sandbox whose pull request saw no activity for this long is deleted. */
+      idle_days: z.number().int().min(1).max(30).default(14),
     })
     .prefault({}),
   limits: z
@@ -150,6 +165,26 @@ export const configSchema = z.object({
       parallel_runs: z.number().int().positive().default(3),
       setup_minutes: z.number().int().positive().default(15),
       verify_minutes: z.number().int().positive().default(15),
+      /** Open Lockkeeper pull requests per repository. New runs wait while it is reached. */
+      open_prs_per_repo: z.number().int().positive().default(10),
+      /** Runs started in any 24 hours, follow-ups included. New runs wait while it is reached. */
+      runs_per_day: z.number().int().positive().default(40),
+    })
+    .prefault({}),
+  /** F1: follow-ups on review feedback. */
+  review: z
+    .object({
+      enabled: z.boolean().default(true),
+      /** Follow-up rounds per pull request, from reviews and `/agent` comments together. */
+      rounds: z.number().int().min(0).max(10).default(2),
+      /** Every changes-requested review starts a follow-up, not only `/agent` comments. */
+      changes_requested: z.boolean().default(true),
+    })
+    .prefault({}),
+  /** Automatic rounds that fix failed CI checks on Lockkeeper's pull requests. */
+  ci: z
+    .object({
+      fix_rounds: z.number().int().min(0).max(5).default(2),
     })
     .prefault({}),
   /** R1: a short read-only pass that decides whether a ticket can be built as written. */
@@ -178,6 +213,7 @@ export interface ProjectSettings {
   verify: string[] | undefined;
   protectedPaths: string[];
   allowExternal: boolean;
+  review: { rounds: number; changesRequested: boolean };
 }
 
 export function projectSettings(
@@ -196,6 +232,10 @@ export function projectSettings(
     protectedPaths: project.protected_paths ??
       config.repo.protected_paths ?? [...DEFAULT_PROTECTED_PATHS],
     allowExternal: project.allow_external ?? config.jira.allow_external,
+    review: {
+      rounds: project.review?.rounds ?? config.review.rounds,
+      changesRequested: project.review?.changes_requested ?? config.review.changes_requested,
+    },
   };
 }
 

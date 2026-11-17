@@ -11,8 +11,16 @@ import {
   resumeRun,
   type TriggerInfo,
 } from '../engine/run.js';
-import type { RunRecord, RunState } from '../store/store.js';
+import {
+  FINISHED_STATES,
+  isExecuting,
+  isFollowUp,
+  type NewRun,
+  type RunRecord,
+  type RunState,
+} from '../store/store.js';
 import type { LabelEvent, TicketComment, TicketRef } from '../tracker/tracker.js';
+import { PullRequestWatcher } from './pull-requests.js';
 
 export interface DaemonOptions {
   /** Milliseconds between polls of Jira. */
@@ -33,6 +41,9 @@ const projectOf = (key: string) => key.slice(0, key.lastIndexOf('-'));
 /** Runs whose ticket accepts `/agent retry`, and how long after the run it does. */
 const RETRYABLE: readonly RunState[] = ['in_review', 'failed', 'cancelled', 'done', 'declined'];
 const RETRY_WINDOW_MS = 14 * 24 * 60 * 60_000;
+const DAY_MS = 24 * 60 * 60_000;
+/** How often the provider's sandboxes are checked for ones no run uses any more. */
+const SWEEP_EVERY_MS = 6 * 60 * 60_000;
 
 /**
  * The long-running service behind `lockkeeper start` (T1, T2, T6, E7, F3). It polls
@@ -41,7 +52,9 @@ const RETRY_WINDOW_MS = 14 * 24 * 60 * 60_000;
  * 1. finds tickets with the trigger label, checks who added it, and claims each one
  *    once or refuses it with a comment;
  * 2. stops runs whose label was removed or that got an `/agent stop` comment;
- * 3. starts queued runs while the parallel-run cap allows.
+ * 3. watches Lockkeeper's open pull requests for merges, review feedback and failed CI
+ *    (F1, F2), and deletes sandboxes nothing uses any more;
+ * 4. starts queued runs while the caps allow.
  *
  * At start it resumes runs a previous process left behind. On stop, its own runs stop
  * where they are, with their sandboxes paused, and resume at the next start.
@@ -57,6 +70,8 @@ export class Daemon {
   /** Runs whose ticket had none of Lockkeeper's labels at the last poll. */
   private readonly unlabelled = new Set<string>();
   private wake: (() => void) | undefined;
+  private readonly pullRequests: PullRequestWatcher;
+  private lastSweep: number | undefined;
 
   constructor(
     private readonly deps: RunDeps,
@@ -65,6 +80,10 @@ export class Daemon {
     this.log = deps.log ?? silentLogger;
     this.now = deps.now ?? Date.now;
     this.authorizer = new Authorizer(deps.tracker, deps.config.jira.allow_users, this.now);
+    this.pullRequests = new PullRequestWatcher(deps, {
+      stop: (run, reason) => this.stopRun(run, reason),
+      warnOnce: (key, message) => this.warnOnce(key, message),
+    });
   }
 
   /** Whether anyone in a configured project may start runs (no allow-list). */
@@ -109,7 +128,38 @@ export class Daemon {
     await this.guard('looking for labelled tickets', () => this.pickUp());
     await this.guard('checking active runs', () => this.watch());
     await this.guard('checking for retries', () => this.watchRetries());
+    await this.guard('watching pull requests', () => this.pullRequests.poll());
+    await this.guard('cleaning up sandboxes', async () => {
+      if (this.lastSweep !== undefined && this.now() - this.lastSweep < SWEEP_EVERY_MS) return;
+      this.lastSweep = this.now();
+      await this.sweep();
+    });
     await this.guard('starting queued runs', () => this.startQueued());
+  }
+
+  /**
+   * F2: delete sandboxes left behind, such as by a crash between creating a sandbox and
+   * recording it. Only sandboxes of runs in this install's store are touched, and only
+   * when no unfinished run holds them.
+   */
+  async sweep(): Promise<void> {
+    const { sandboxes, store } = this.deps;
+    if (!sandboxes.listSandboxes) return;
+    for (const sandbox of await sandboxes.listSandboxes('lockkeeper_run')) {
+      const runId = sandbox.metadata.lockkeeper_run as string;
+      const owner = store.getRun(runId);
+      // Another install's, or a store that was reset: leave it to its owner.
+      if (!owner) continue;
+      // A run that is starting may be about to record this sandbox.
+      if (owner.state === 'queued' || isExecuting(owner.state)) continue;
+      const holders = store
+        .runsUsingSandbox(sandbox.id)
+        .filter((run) => !FINISHED_STATES.includes(run.state));
+      if (holders.length > 0) continue;
+      await sandboxes.deleteSandbox(sandbox.id);
+      store.appendEvent(owner.id, 'sandbox_swept', { sandboxId: sandbox.id }, new Date(this.now()));
+      this.log.info(`Deleted sandbox ${sandbox.id}, which run ${runId} left behind.`);
+    }
   }
 
   /** Continue runs whose process stopped, as after a crash or restart. */
@@ -241,6 +291,11 @@ export class Daemon {
     const current = await this.currentLabels([...new Set(runs.map((run) => run.ticketKey))]);
     for (const run of runs) {
       if (this.stopping) return;
+      // Follow-ups start from GitHub, so Jira labels do not stop them. /agent stop does.
+      if (isFollowUp(run.kind)) {
+        await this.readCommands(run);
+        continue;
+      }
       const ticketLabels = current.get(run.ticketKey);
       const ours = [labels.trigger, labels.working, labels.needs_info, labels.in_review];
       const labelled =
@@ -346,49 +401,64 @@ export class Daemon {
     const settings = projectSettings(config, projectOf(previous.ticketKey));
     if (!settings) return;
     const now = new Date(this.now());
-    if (previous.state === 'in_review') {
-      // The new run takes over the ticket and the pull request.
-      store.updateRun(previous.id, { state: 'done', finishedAt: now.toISOString() }, now);
-      store.appendEvent(previous.id, 'superseded', { by: comment.author.displayName }, now);
-      if (previous.sandboxId) {
-        try {
-          await (await sandboxes.connect(previous.sandboxId)).destroy();
-        } catch (error) {
-          this.log.debug(`Could not delete sandbox ${previous.sandboxId}: ${errorMessage(error)}`);
-        }
-      }
-    }
     // The ticket's latest run that published continues on its branch, even when a retry
     // since then was stopped before it committed. Otherwise the attempt starts afresh.
     const published = store
       .listRuns({ ticketKey: previous.ticketKey, limit: 20 })
       .find((run) => run.headSha && run.branch);
     const branch = published?.branch ?? null;
+    // An open pull request on that branch stays the ticket's, so it is still watched.
+    const openPr =
+      branch && published?.prNumber && published.prState === 'open'
+        ? { prNumber: published.prNumber, prUrl: published.prUrl, prState: 'open' as const }
+        : {};
     const trigger: TriggerInfo = {
       source: 'retry',
       at: comment.created,
       eventId: `comment:${comment.id}`,
       by: { accountId: comment.author.accountId, displayName: comment.author.displayName },
     };
+    const input: NewRun = {
+      ticketKey: previous.ticketKey,
+      tracker: tracker.kind,
+      repo: previous.repo,
+      baseBranch: settings.baseBranch,
+      workflow: previous.workflow,
+      agent: agent.id,
+      triggeredBy: `jira:${comment.author.displayName}`,
+      triggerInfo: JSON.stringify(trigger),
+      state: 'queued',
+      kind: 'retry',
+      parentRunId: previous.id,
+      commentsSeen: comment.id,
+      ...(hint ? { hint } : {}),
+      ...(branch ? { branch } : {}),
+      ...openPr,
+    };
     try {
-      const run = store.createRun(
-        {
-          ticketKey: previous.ticketKey,
-          tracker: tracker.kind,
-          repo: previous.repo,
-          baseBranch: settings.baseBranch,
-          workflow: previous.workflow,
-          agent: agent.id,
-          triggeredBy: `jira:${comment.author.displayName}`,
-          triggerInfo: JSON.stringify(trigger),
-          state: 'queued',
-          parentRunId: previous.id,
-          commentsSeen: comment.id,
-          ...(hint ? { hint } : {}),
-          ...(branch ? { branch } : {}),
-        },
-        now,
-      );
+      // The new run takes over the ticket and the pull request. Another attempt starts
+      // in a fresh sandbox, so the parked one goes.
+      const run =
+        previous.state === 'in_review'
+          ? store.supersede(
+              previous.id,
+              { state: 'done', finishedAt: now.toISOString(), sandboxId: null },
+              input,
+              now,
+            )
+          : store.createRun(input, now);
+      if (previous.state === 'in_review') {
+        store.appendEvent(previous.id, 'superseded', { by: run.id }, now);
+        if (previous.sandboxId) {
+          try {
+            await sandboxes.deleteSandbox(previous.sandboxId);
+          } catch (error) {
+            this.log.debug(
+              `Could not delete sandbox ${previous.sandboxId}: ${errorMessage(error)}`,
+            );
+          }
+        }
+      }
       store.appendEvent(run.id, 'trigger', trigger, now);
       this.log.step(
         `${previous.ticketKey}: ${comment.author.displayName} asked for another attempt${branch ? ` on ${branch}` : ''}`,
@@ -457,6 +527,9 @@ export class Daemon {
     );
     store.appendEvent(run.id, 'cancelled', { reason }, now);
     this.log.warn(`${run.ticketKey}: ${reason}`);
+    // A follow-up that never started leaves the pull request, its labels and the status
+    // comment as they were.
+    if (isFollowUp(run.kind)) return;
     if (run.statusCommentId) {
       await tracker.updateComment(
         run.ticketKey,
@@ -469,13 +542,17 @@ export class Daemon {
     });
   }
 
-  /** E7: start queued runs while slots are free; tell the others they are queued (T1). */
+  /**
+   * E7: start queued runs while the caps allow; tell the others why they wait (T1). The
+   * open-PR cap holds back new tickets only: follow-ups add to a PR that is open already.
+   */
   private async startQueued(): Promise<void> {
     const { store, config, tracker, agent } = this.deps;
     for (const run of store.runsInState('queued')) {
       if (this.stopping) return;
       if (this.running.has(run.id)) continue;
-      if (store.countExecutingRuns() < config.limits.parallel_runs) {
+      const waiting = this.waitReason(run);
+      if (!waiting) {
         this.launch(run);
         continue;
       }
@@ -485,7 +562,7 @@ export class Daemon {
         queuedDoc({
           key: run.ticketKey,
           runId: run.id,
-          slots: config.limits.parallel_runs,
+          waiting,
           agentName: agent.displayName,
           limits: { costUsd: config.limits.cost_usd, minutes: config.limits.minutes },
         }),
@@ -496,6 +573,26 @@ export class Daemon {
         remove: [config.jira.labels.trigger],
       });
     }
+  }
+
+  /** Why a queued run cannot start yet, or undefined when it can. */
+  private waitReason(run: RunRecord): string | undefined {
+    const { store, config } = this.deps;
+    const limits = config.limits;
+    if (store.countExecutingRuns() >= limits.parallel_runs) {
+      return `All ${limits.parallel_runs} run slots are busy, so this run starts when one is free.`;
+    }
+    const today = store.countStartedSince(new Date(this.now() - DAY_MS));
+    if (today >= limits.runs_per_day) {
+      return `${today} runs started in the last 24 hours, the daily limit (limits.runs_per_day). This run starts when that count drops.`;
+    }
+    if (run.kind === 'ticket') {
+      const open = store.countOpenPullRequests(run.repo);
+      if (open >= limits.open_prs_per_repo) {
+        return `${open} Lockkeeper pull ${open === 1 ? 'request is' : 'requests are'} open in ${run.repo}, the limit (limits.open_prs_per_repo). This run starts when one is merged or closed.`;
+      }
+    }
+    return undefined;
   }
 
   private launch(run: RunRecord): void {

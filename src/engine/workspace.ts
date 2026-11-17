@@ -92,6 +92,46 @@ export async function cloneRepo(
   }
 }
 
+/**
+ * Bring a resumed sandbox's checkout to the head of a pull request branch, as GitHub
+ * has it (F1). Ignored files such as installed dependencies stay, which is the point
+ * of resuming. Earlier changes were already published, so nothing of value is lost.
+ */
+export async function updateCheckout(
+  sandbox: SandboxHandle,
+  layout: Layout,
+  access: CloneAccess,
+  head: BaseRef,
+  also: BaseRef,
+  timeoutMs: number,
+): Promise<void> {
+  if (!isObjectId(head.sha) || !isObjectId(also.sha)) throw new Error('Invalid commit to fetch.');
+  const auth = access.authHeader ? '-c http.extraHeader="$LOCKKEEPER_GIT_AUTH" ' : '';
+  const refspec = (branch: string) => q(`+refs/heads/${branch}:refs/remotes/origin/${branch}`);
+  const script = [
+    'set -e',
+    `cd ${q(layout.repo)}`,
+    `git ${auth}fetch --quiet --no-tags origin ${refspec(head.branch)} ${refspec(also.branch)}`,
+    `git cat-file -e ${head.sha}^{commit}`,
+    `git cat-file -e ${also.sha}^{commit}`,
+    `git checkout --quiet --force --detach ${head.sha}`,
+    `git reset --quiet --hard ${head.sha}`,
+    'git clean -fdq',
+    'git rev-parse HEAD',
+  ].join('\n');
+  const env: Record<string, string> = { GIT_TERMINAL_PROMPT: '0' };
+  if (access.authHeader) env.LOCKKEEPER_GIT_AUTH = access.authHeader;
+  const result = await sandbox.exec(script, { env, timeoutMs });
+  const sha = result.stdout.trim().split('\n').at(-1);
+  if (result.exitCode !== 0 || sha !== head.sha) {
+    throw new StepFailedError(
+      'clone',
+      `Updating the checkout to ${head.branch} failed (exit ${result.exitCode}).`,
+      tail(result.stderr || result.stdout),
+    );
+  }
+}
+
 /** Put the checkout back to a commit, removing every change and untracked file. */
 export async function resetCheckout(
   sandbox: SandboxHandle,

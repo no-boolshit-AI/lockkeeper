@@ -123,6 +123,68 @@ describe('the store', () => {
     expect(store.createRun(newRun('SHOP-9')).ticketKey).toBe('SHOP-9');
   });
 
+  it('marks retries and open pull requests when upgrading from the M2 schema', () => {
+    dir = mkdtempSync(join(tmpdir(), 'lockkeeper-store-'));
+    const path = join(dir, 'm2.db');
+    const db = new DatabaseSync(path);
+    db.exec(MIGRATIONS[0] as string);
+    db.exec(MIGRATIONS[1] as string);
+    db.exec('PRAGMA user_version = 2');
+    const insert = db.prepare(
+      `INSERT INTO runs (id, ticket_key, tracker, repo, base_branch, workflow, agent, state, pr_number, trigger_info, created_at, updated_at)
+       VALUES (?, ?, 'jira-cloud', 'acme/shop', 'main', 'feature', 'claude-code', ?, ?, ?, ?, ?)`,
+    );
+    insert.run(
+      'm2-1',
+      'SHOP-1',
+      'done',
+      3,
+      '{"source":"label"}',
+      '2026-11-01T00:00:00Z',
+      '2026-11-01T00:00:00Z',
+    );
+    insert.run(
+      'm2-2',
+      'SHOP-1',
+      'in_review',
+      3,
+      '{"source":"retry"}',
+      '2026-11-02T00:00:00Z',
+      '2026-11-02T00:00:00Z',
+    );
+    db.close();
+    store = Store.open(path);
+    expect(store.getRun('m2-1')).toMatchObject({ kind: 'ticket', prState: 'open' });
+    expect(store.getRun('m2-2')).toMatchObject({ kind: 'retry', prState: 'open', prSeen: null });
+    // Only the newest run of a ticket watches its pull request.
+    expect(store.pullRequestRuns().map((run) => run.id)).toEqual(['m2-2']);
+    expect(store.countOpenPullRequests('acme/shop')).toBe(1);
+  });
+
+  it('hands a ticket to its next run in one transaction', () => {
+    store = Store.open(':memory:');
+    const t0 = new Date('2026-11-16T10:00:00Z');
+    const first = store.createRun({ ...newRun(), state: 'in_review', sandboxId: 'sbx-1' }, t0);
+    const blocker = store.createRun(newRun('SHOP-2'), t0);
+    // A failed hand-over leaves the first run as it was.
+    expect(() =>
+      store?.supersede(first.id, { state: 'done', sandboxId: null }, newRun('SHOP-2'), t0),
+    ).toThrow(AlreadyActiveError);
+    expect(store.getRun(first.id)).toMatchObject({ state: 'in_review', sandboxId: 'sbx-1' });
+    expect(blocker.state).toBe('queued');
+
+    const next = store.supersede(
+      first.id,
+      { state: 'done', sandboxId: null },
+      { ...newRun(), kind: 'review', parentRunId: first.id, sandboxId: 'sbx-1', prNumber: 4 },
+      new Date('2026-11-16T11:00:00Z'),
+    );
+    expect(store.getRun(first.id)).toMatchObject({ state: 'done', sandboxId: null });
+    expect(next).toMatchObject({ kind: 'review', sandboxId: 'sbx-1', prNumber: 4 });
+    expect(store.runsUsingSandbox('sbx-1').map((run) => run.id)).toEqual([next.id]);
+    expect(store.countFollowUps('SHOP-1', 4, 'review')).toBe(1);
+  });
+
   it('keeps an ordered audit log per run', () => {
     store = Store.open(':memory:');
     const run = store.createRun(newRun());

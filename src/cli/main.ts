@@ -402,7 +402,7 @@ program
       for (const run of runs) {
         const cost = run.costUsd === null ? '' : `$${run.costUsd.toFixed(2)}`;
         out(
-          `${run.id}  ${run.ticketKey.padEnd(12)} ${run.state.padEnd(10)} ${cost.padEnd(7)} ${run.prUrl ?? run.error ?? ''}`,
+          `${run.id}  ${run.ticketKey.padEnd(12)} ${run.kind.padEnd(7)} ${run.state.padEnd(10)} ${cost.padEnd(7)} ${run.prUrl ?? run.error ?? ''}`,
         );
       }
     } finally {
@@ -426,8 +426,9 @@ program
       }
       if (run.sandboxId) {
         try {
-          const sandbox = await makeE2B(context).connect(run.sandboxId);
-          await sandbox.destroy();
+          // Deleted by ID, so a paused sandbox is not resumed just to be deleted.
+          await makeE2B(context).deleteSandbox(run.sandboxId);
+          store.updateRun(run.id, { sandboxId: null });
           out(`Deleted sandbox ${run.sandboxId}.`);
         } catch (error) {
           out(`Could not delete sandbox ${run.sandboxId}: ${(error as Error).message}`);

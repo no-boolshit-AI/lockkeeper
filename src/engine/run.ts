@@ -21,9 +21,20 @@ import {
 import { type Logger, silentLogger } from '../core/log.js';
 import { checkContents, checkDiff, type PolicyResult } from '../policy/diff-policy.js';
 import { redactSecrets } from '../policy/secrets.js';
-import type { SandboxHandle, SandboxProvider, SecretBinding } from '../sandbox/sandbox.js';
+import {
+  type SandboxHandle,
+  type SandboxProvider,
+  type SecretBinding,
+  shellQuote,
+} from '../sandbox/sandbox.js';
 import type { BaseRef, CommitResult, PullRequest, SourceControl } from '../scm/scm.js';
-import { isExecuting, type RunRecord, type RunState, type Store } from '../store/store.js';
+import {
+  isExecuting,
+  isFollowUp,
+  type RunRecord,
+  type RunState,
+  type Store,
+} from '../store/store.js';
 import { RecordingTracker } from '../tracker/recording-tracker.js';
 import type { TicketSnapshot, Tracker } from '../tracker/tracker.js';
 import { detectCommands } from './detect.js';
@@ -41,10 +52,12 @@ import {
 import {
   type AgentReport,
   buildFixPrompt,
+  buildFollowUpPrompt,
   buildReadinessPrompt,
   buildReadinessSystemPrompt,
   buildSystemPrompt,
   buildTaskPrompt,
+  type FollowUpFeedback,
   type InstructionFile,
   matchCriteria,
   parseAgentReport,
@@ -56,9 +69,14 @@ import {
   capPullRequestBody,
   cleanAgentText,
   declinedDoc,
+  type FollowUpReply,
   failedDoc,
   finalNoticeDoc,
+  followUpFailedDoc,
+  followUpNoChangesDoc,
+  followUpReplyDoc,
   noChangesDoc,
+  type Outcome,
   pickedUpDoc,
   progressDoc,
   pullRequestBodyDoc,
@@ -85,6 +103,7 @@ import {
   type StopRequest,
   startAgent,
   tail,
+  updateCheckout,
   watchAgent,
 } from './workspace.js';
 
@@ -172,7 +191,7 @@ class RunDetachedError extends Error {}
 
 /** How a run was started, kept as JSON on the run (O2: who triggered it). */
 export interface TriggerInfo {
-  source: 'label' | 'cli' | 'retry' | 'answers';
+  source: 'label' | 'cli' | 'retry' | 'answers' | 'review' | 'ci';
   by?: { accountId: string; displayName: string };
   label?: string;
   /** The label change that started the run, so it is never acted on twice. */
@@ -294,12 +313,29 @@ export async function runTicket(deps: RunDeps, request: RunRequest): Promise<Run
       now,
     );
   }
+  const limits = deps.config.limits;
   const executing = deps.store.countExecutingRuns();
-  if (executing >= deps.config.limits.parallel_runs) {
+  if (executing >= limits.parallel_runs) {
     throw new CapExceededError(
       'parallel_runs',
       `${executing} runs are already active, the limit for this install (limits.parallel_runs).`,
     );
+  }
+  if (!request.dryRun) {
+    const today = deps.store.countStartedSince(new Date(nowMs - 24 * 60 * 60_000));
+    if (today >= limits.runs_per_day) {
+      throw new CapExceededError(
+        'runs_per_day',
+        `${today} runs started in the last 24 hours, the daily limit for this install (limits.runs_per_day).`,
+      );
+    }
+    const open = deps.store.countOpenPullRequests(settings.repo);
+    if (open >= limits.open_prs_per_repo) {
+      throw new CapExceededError(
+        'open_prs_per_repo',
+        `${open} Lockkeeper pull ${open === 1 ? 'request is' : 'requests are'} open in ${settings.repo}, the limit (limits.open_prs_per_repo). Merge or close one first.`,
+      );
+    }
   }
   // T6: claiming the ticket is the first write, and it fails if a run is active.
   const run = deps.store.createRun(
@@ -382,6 +418,14 @@ class TicketRun {
   /** What earlier agent sessions of this run cost, such as the readiness check. */
   private priorCostUsd: number;
   private leaseLost = false;
+  /** Review and CI follow-ups add to an open pull request (F1). */
+  private readonly followUp: boolean;
+  /** The paused sandbox a follow-up took over from the run before it, to resume. */
+  private inheritedSandbox: string | undefined;
+  /** Round 0 continues the earlier run's agent session instead of starting one. */
+  private resumeSession = false;
+  /** What the resumed session had cost before this run. The agent's total includes it. */
+  private sessionBaseCostUsd = 0;
 
   constructor(
     private readonly deps: RunDeps,
@@ -402,6 +446,15 @@ class TicketRun {
     // The time limit counts from the run's first start, including any time it was stopped.
     this.startedAt = run.startedAt ? Date.parse(run.startedAt) : this.now();
     this.deadline = this.startedAt + deps.config.limits.minutes * 60_000;
+    this.followUp = isFollowUp(run.kind);
+    const session = deps.store.latestEvent<{ resumed?: boolean; baseCostUsd?: number }>(
+      run.id,
+      'session',
+    );
+    if (session?.resumed) {
+      this.resumeSession = true;
+      this.sessionBaseCostUsd = session.baseCostUsd ?? 0;
+    }
   }
 
   async execute(): Promise<RunResult> {
@@ -433,7 +486,7 @@ class TicketRun {
 
   private async steps(): Promise<RunResult> {
     if (this.run.state === 'queued' || this.run.state === 'snapshot') {
-      const early = await this.begin();
+      const early = this.followUp ? await this.beginFollowUp() : await this.begin();
       if (early) return early;
     } else {
       this.restore();
@@ -492,6 +545,56 @@ class TicketRun {
     return undefined;
   }
 
+  /**
+   * F1: a follow-up works from the ticket as its first run saw it, and says nothing new
+   * in Jira beyond updating the status comment. Its replies go on the pull request.
+   */
+  private async beginFollowUp(): Promise<RunResult | undefined> {
+    const key = this.run.ticketKey;
+    this.inheritedSandbox = this.run.sandboxId ?? undefined;
+    this.setState('snapshot');
+    const parent = this.run.parentRunId;
+    const saved = parent
+      ? this.deps.store.latestEvent<TicketSnapshot>(parent, 'snapshot')
+      : undefined;
+    this.log.step(
+      `${this.replyInfo().kind === 'ci' ? 'Fixing failed CI checks' : 'Answering review feedback'} on pull request #${this.run.prNumber}`,
+    );
+    this.ticket = saved ?? (await this.tracker.snapshot(key));
+    this.audit('snapshot', this.ticket);
+    this.settings =
+      projectSettings(this.deps.config, this.settings.key, this.run.repo) ?? this.settings;
+    await this.progress(this.context(), this.followUpStep());
+    this.checkCancelled();
+    return undefined;
+  }
+
+  private feedback(): FollowUpFeedback | undefined {
+    return this.deps.store.latestEvent<FollowUpFeedback>(this.run.id, 'feedback');
+  }
+
+  /** What a follow-up answers, whose it is and which round, for its replies. */
+  private replyInfo(): FollowUpReply {
+    const feedback = this.feedback();
+    const kind = feedback?.kind ?? (this.run.kind === 'ci' ? 'ci' : 'review');
+    const rounds = kind === 'ci' ? this.deps.config.ci.fix_rounds : this.settings.review.rounds;
+    const round =
+      this.run.prNumber === null
+        ? 1
+        : this.deps.store.countFollowUps(this.run.ticketKey, this.run.prNumber, kind);
+    const authors =
+      feedback?.kind === 'review' ? [...new Set(feedback.items.map((item) => item.author))] : [];
+    const checks = feedback?.kind === 'ci' ? feedback.checks.map((check) => check.name) : [];
+    return { kind, round, rounds, authors, ...(checks.length > 0 ? { checks } : {}) };
+  }
+
+  private followUpStep(): string {
+    const reply = this.replyInfo();
+    return reply.kind === 'ci'
+      ? `CI fix ${reply.round} of ${reply.rounds}: the agent is fixing the failed CI checks`
+      : `follow-up ${reply.round} of ${reply.rounds}: the agent is working on review feedback`;
+  }
+
   /** Load what an earlier process captured, for a run resumed after the snapshot. */
   private restore(): void {
     const ticket = this.deps.store.latestEvent<TicketSnapshot>(this.run.id, 'snapshot');
@@ -513,8 +616,15 @@ class TicketRun {
       await this.reconnect(this.run.sandboxId, this.run.baseSha);
       return;
     }
+    if (this.inheritedSandbox) {
+      const inherited = this.inheritedSandbox;
+      this.inheritedSandbox = undefined;
+      if (await this.resumeFollowUp(inherited)) return;
+    }
     // A sandbox from a run cut short while preparing is not trusted: start a new one.
     if (this.run.sandboxId) await this.discardSandbox(this.run.sandboxId);
+    // Without the earlier sandbox there is no session to continue: start a new one.
+    if (this.followUp && this.run.sessionId) this.update({ sessionId: null });
 
     this.setState('sandbox');
     const { base, instructionsBase } = await this.startPoint();
@@ -522,25 +632,19 @@ class TicketRun {
     this.update({ baseSha: base.sha });
     this.branchBase = instructionsBase;
     this.audit('start_point', { base, instructionsBase });
-    const secrets: SecretBinding[] = [];
-    if (this.deps.modelKey.mode === 'egress') {
-      const credential: SecretBinding = {
-        name: this.deps.modelKey.secretName,
-        host: agent.credential.host,
-        header: agent.credential.header,
-      };
-      if (agent.credential.prefix) credential.prefix = agent.credential.prefix;
-      secrets.push(credential);
-    } else {
+    if (this.followUp && !this.continuing) {
+      throw new StepFailedError(
+        'sandbox',
+        `The pull request's branch no longer exists, so there is nothing to add to.`,
+      );
+    }
+    const secrets = this.secretBindings();
+    if (this.deps.modelKey.mode === 'env') {
       this.log.warn(
         'The model key is passed into the sandbox environment. Run `lockkeeper secrets sync` to have E2B add it outside the sandbox instead.',
       );
     }
-    const allowDomains = allowList({
-      agentDomains: [agent.credential.host, ...agent.extraDomains],
-      extra: config.sandbox.allow_domains,
-      ...(config.sandbox.registries ? { registries: config.sandbox.registries } : {}),
-    });
+    const allowDomains = this.allowDomains();
     this.log.step(`Starting a sandbox on ${sandboxes.displayName}`);
     // A new key per attempt: a retry after a crash reuses the sandbox the crash left
     // unrecorded, and an attempt after a discarded sandbox gets a fresh one.
@@ -673,6 +777,138 @@ class TicketRun {
       this.log.info('GitHub is closed to the sandbox for the rest of the run.');
     }
     this.checkCancelled();
+  }
+
+  /** The model key as an egress secret, when the proxy adds it (E3). */
+  private secretBindings(): SecretBinding[] {
+    const { agent, modelKey } = this.deps;
+    if (modelKey.mode !== 'egress') return [];
+    const credential: SecretBinding = {
+      name: modelKey.secretName,
+      host: agent.credential.host,
+      header: agent.credential.header,
+    };
+    if (agent.credential.prefix) credential.prefix = agent.credential.prefix;
+    return [credential];
+  }
+
+  private allowDomains(): string[] {
+    const { config, agent } = this.deps;
+    return allowList({
+      agentDomains: [agent.credential.host, ...agent.extraDomains],
+      extra: config.sandbox.allow_domains,
+      ...(config.sandbox.registries ? { registries: config.sandbox.registries } : {}),
+    });
+  }
+
+  /**
+   * F1: resume the paused sandbox the earlier run left, with its installed dependencies
+   * and the agent's session, and bring its checkout to the pull request branch. False
+   * when it cannot; a fresh sandbox then continues from the branch.
+   */
+  private async resumeFollowUp(sandboxId: string): Promise<boolean> {
+    const { config, scm, sandboxes, store } = this.deps;
+    this.setState('sandbox');
+    const { base, instructionsBase } = await this.startPoint();
+    this.base = base;
+    if (!this.continuing) {
+      this.base = undefined;
+      await this.discardSandbox(sandboxId);
+      return false;
+    }
+    const allowDomains = this.allowDomains();
+    const secrets = this.secretBindings();
+    const closeGitHub = config.sandbox.close_github_after_setup;
+    try {
+      this.log.step(`Resuming sandbox ${sandboxId}`);
+      const sandbox = await sandboxes.connect(sandboxId);
+      this.sandbox = sandbox;
+      const layout = layoutFor(sandbox.homeDir);
+      this.layout = layout;
+      await this.extendSandbox(this.sandboxTimeout());
+      // The earlier run's agent files move aside, so this run's rounds start clean.
+      const work = shellQuote(layout.work);
+      const earlier = shellQuote(`${layout.work}-earlier`);
+      await sandbox.exec(
+        `rm -rf ${earlier}; if [ -d ${work} ]; then mv ${work} ${earlier}; fi; mkdir -p ${work}`,
+        { timeoutMs: 30_000 },
+      );
+      if (closeGitHub && sandbox.setEgress) await sandbox.setEgress(allowDomains, secrets);
+      const access = await scm.cloneAccess(this.settings.repo);
+      await updateCheckout(
+        sandbox,
+        layout,
+        access,
+        base,
+        instructionsBase,
+        this.stepTimeout(10 * 60_000),
+      );
+      if (closeGitHub && sandbox.setEgress) {
+        await sandbox.setEgress(
+          allowDomains.filter((domain) => !GITHUB_DOMAINS.includes(domain)),
+          secrets,
+        );
+      }
+      // Rule 5: instruction files from the base branch, as for every run.
+      this.instructions = await readInstructionFiles(sandbox, layout, instructionsBase.sha);
+    } catch (error) {
+      this.log.warn(
+        `The paused sandbox could not be resumed, so a fresh one continues from the branch. ${(error as Error).message}`,
+      );
+      this.sandbox = undefined;
+      this.layout = undefined;
+      this.base = undefined;
+      await this.discardSandbox(sandboxId);
+      if (this.run.sessionId) this.update({ sessionId: null });
+      return false;
+    }
+    this.branchBase = instructionsBase;
+    this.update({ baseSha: base.sha });
+    this.audit('start_point', { base, instructionsBase });
+    this.audit('sandbox', {
+      id: sandboxId,
+      provider: sandboxes.kind,
+      resumed: true,
+      allowDomains,
+      modelKey: this.deps.modelKey.mode,
+      capabilities: sandboxes.capabilities,
+    });
+    this.audit(
+      'instructions',
+      this.instructions.map((file) => ({ path: file.path, bytes: file.content.length })),
+    );
+    // The commands the first run worked out. Nothing is set up again.
+    const parent = this.run.parentRunId;
+    const commands = parent
+      ? store.latestEvent<{ setup: string[]; verify: string[]; sources: unknown }>(
+          parent,
+          'commands',
+        )
+      : undefined;
+    this.verify = commands?.verify ?? this.settings.verify ?? [];
+    this.audit('commands', commands ?? { setup: [], verify: this.verify, sources: {} });
+    if (this.run.sessionId && parent) {
+      this.resumeSession = true;
+      this.sessionBaseCostUsd = this.sessionCostOf(parent);
+      this.audit('session', {
+        resumed: true,
+        sessionId: this.run.sessionId,
+        baseCostUsd: this.sessionBaseCostUsd,
+      });
+    }
+    this.checkCancelled();
+    return true;
+  }
+
+  /** What an earlier run's agent session had cost in total when that run stopped. */
+  private sessionCostOf(runId: string): number {
+    const { store } = this.deps;
+    const exit = store.latestEvent<{ sessionCostUsd?: number }>(runId, 'agent_exit');
+    if (exit?.sessionCostUsd !== undefined) return exit.sessionCostUsd;
+    const readiness = store
+      .events(runId, { kind: 'readiness' })
+      .reduce((sum, event) => sum + ((event.data as { costUsd?: number }).costUsd ?? 0), 0);
+    return Math.max(0, (store.getRun(runId)?.costUsd ?? 0) - readiness);
   }
 
   /**
@@ -902,8 +1138,7 @@ class TicketRun {
 
   private async discardSandbox(sandboxId: string): Promise<void> {
     try {
-      const stale = await this.deps.sandboxes.connect(sandboxId);
-      await stale.destroy();
+      await this.deps.sandboxes.deleteSandbox(sandboxId);
     } catch (error) {
       this.log.debug(`Could not delete sandbox ${sandboxId}: ${(error as Error).message}`);
     }
@@ -976,22 +1211,30 @@ class TicketRun {
           if (round > 0) {
             throw new StepFailedError('implement', `The prompt for fix round ${round} is missing.`);
           }
-          prompt = buildTaskPrompt(ticket, workflow, {
-            ...(this.run.hint ? { hint: this.run.hint } : {}),
-            earlierAttempt: this.continuing,
-            ...this.answersForPrompt(),
-          });
+          prompt = this.followUp
+            ? this.followUpPrompt(ticket)
+            : buildTaskPrompt(ticket, workflow, {
+                ...(this.run.hint ? { hint: this.run.hint } : {}),
+                earlierAttempt: this.continuing,
+                ...this.answersForPrompt(),
+              });
           this.audit('prompt', { round: 0, system, prompt });
         }
         this.setState('implement', { round });
         await this.progress(
           ctx,
-          round === 0
-            ? 'the agent is implementing the ticket'
-            : `fix round ${round}: the agent is fixing failed checks`,
+          round > 0
+            ? `fix round ${round}: the agent is fixing failed checks`
+            : this.followUp
+              ? this.followUpStep()
+              : 'the agent is implementing the ticket',
         );
         this.log.step(
-          round === 0 ? `${agent.displayName} is implementing ${key}` : `Fix round ${round}`,
+          round > 0
+            ? `Fix round ${round}`
+            : this.followUp
+              ? `${agent.displayName} is working on the ${this.run.kind === 'ci' ? 'failed CI checks' : 'review feedback'}`
+              : `${agent.displayName} is implementing ${key}`,
         );
         let text: string;
         try {
@@ -1008,6 +1251,7 @@ class TicketRun {
         report = parseAgentReport(text) ?? report;
 
         if (round === 0 && !(await this.hasChanges(sandbox, layout, base.sha))) {
+          if (this.followUp) return this.followUpNoChanges(ctx, finalText);
           return this.noChanges(ctx, cleanAgentText(stripReport(finalText), 1_500));
         }
       }
@@ -1066,6 +1310,14 @@ class TicketRun {
     this.audit('implemented', work);
     this.setState('collect');
     return work;
+  }
+
+  private followUpPrompt(ticket: TicketSnapshot): string {
+    const feedback = this.feedback();
+    if (!feedback) {
+      throw new StepFailedError('implement', 'The follow-up has no saved feedback to work on.');
+    }
+    return buildFollowUpPrompt({ ticket, feedback, resumed: this.resumeSession });
   }
 
   /**
@@ -1168,8 +1420,10 @@ class TicketRun {
       }),
     );
     this.audit('policy', { files: reviewed.files, findings: policy.findings });
-    if (collected.files.length === 0)
+    if (collected.files.length === 0) {
+      if (this.followUp) return this.followUpNoChanges(ctx, work.finalText);
       return this.noChanges(ctx, cleanAgentText(stripReport(work.finalText), 1_500));
+    }
     if (policy.blocked) {
       const blocking = policy.findings.filter((finding) => finding.severity === 'block');
       throw new StepFailedError(
@@ -1180,6 +1434,7 @@ class TicketRun {
 
     const report = work.report;
     const summary = cleanAgentText(report?.summary || stripReport(work.finalText), 1_500);
+    const reply = cleanAgentText(report?.reply || summary, 1_500);
     const risks = (report?.risks ?? [])
       .slice(0, 10)
       .map((risk) => cleanAgentText(risk, 300))
@@ -1217,6 +1472,7 @@ class TicketRun {
       checks: work.checks,
       draftReasons,
       reviewedFiles: reviewed.files.length,
+      reply,
       ...(work.proof ? { proof: work.proof } : {}),
     });
   }
@@ -1258,6 +1514,8 @@ class TicketRun {
     draftReasons: string[];
     /** Files the pull request changes in total, which a retry's commit may not all touch. */
     reviewedFiles: number;
+    /** Follow-ups: what changed this time, for the reply on the pull request. */
+    reply: string;
     proof?: FailingTestProof;
   }): Promise<RunResult> {
     const { config, scm } = this.deps;
@@ -1289,6 +1547,7 @@ class TicketRun {
           durationMs,
           fixRounds: this.fixRounds,
           ...(input.proof ? { proof: input.proof } : {}),
+          ...this.pullRequestTotal(),
         }),
       ),
     );
@@ -1322,7 +1581,12 @@ class TicketRun {
         branch ??= await this.availableBranch(wantedBranch);
         this.update({ branch });
         // V3: commits and the PR are created here, under the App identity, never in the sandbox.
-        const message = `${title}\n\n${input.summary}\n\nTicket: ${ticket.url}\nLockkeeper-Run: ${this.run.id}\nAgent: ${this.deps.agent.displayName}\n`;
+        // A follow-up's commit says what it answered; the PR title keeps the ticket's.
+        const subject = this.followUp
+          ? `${key}: ${this.run.kind === 'ci' ? 'fix failed CI checks' : 'address review feedback'}`
+          : title;
+        const body = this.followUp ? input.reply : input.summary;
+        const message = `${subject}\n\n${body}\n\nTicket: ${ticket.url}\nLockkeeper-Run: ${this.run.id}\nAgent: ${this.deps.agent.displayName}\n`;
         let commit: CommitResult;
         try {
           commit = await scm.commit({
@@ -1352,12 +1616,15 @@ class TicketRun {
         this.log.step(`Committed ${commit.sha.slice(0, 12)} to ${branch}`);
       }
       const head = branch as string;
-      if (this.run.prUrl && this.run.prNumber !== null) {
-        pr = { url: this.run.prUrl, number: this.run.prNumber, draft, state: 'open' };
+      // The run's own record says whether it already opened or updated the PR. A
+      // follow-up inherits the PR's number, but still has to bring its body up to date.
+      const handled = this.deps.store.latestEvent<PullRequest>(this.run.id, 'pull_request');
+      if (handled) {
+        pr = { url: handled.url, number: handled.number, draft, state: 'open' };
       } else {
         const existing = await scm.findPullRequest(this.settings.repo, head);
         if (existing?.state === 'open') {
-          // A retry, or a restart after opening it: bring the open PR up to date.
+          // A retry, a follow-up, or a restart after opening it: bring the open PR up to date.
           pr = await scm.updatePullRequest(this.settings.repo, existing.number, { body, draft });
           this.log.step(`Updated pull request ${pr.url}`);
         } else {
@@ -1371,7 +1638,7 @@ class TicketRun {
           });
           this.log.step(`Opened ${pr.draft || draft ? 'draft ' : ''}pull request ${pr.url}`);
         }
-        this.update({ prNumber: pr.number, prUrl: pr.url });
+        this.update({ prNumber: pr.number, prUrl: pr.url, prState: 'open' });
         this.audit('pull_request', pr);
       }
     }
@@ -1390,9 +1657,33 @@ class TicketRun {
       durationMs: this.now() - this.startedAt,
       fixRounds: this.fixRounds,
     };
+    // Saved so the status comment can be closed out on merge (F2) or restored later.
+    this.audit('outcome', outcome);
     if (this.statusCommentId)
       await this.tracker.updateComment(key, this.statusCommentId, resultDoc(ctx, outcome));
-    if (!this.deps.store.latestEvent(this.run.id, 'final_notice')) {
+    if (this.followUp) {
+      // F1: reviewers stay in GitHub, so a follow-up answers on the pull request.
+      if (!dryRun && !this.deps.store.latestEvent(this.run.id, 'pr_reply')) {
+        const commit = this.deps.store.latestEvent<{ sha: string; url: string }>(
+          this.run.id,
+          'commit',
+        );
+        const reply = docToMarkdown(
+          followUpReplyDoc(ctx, {
+            ...this.replyInfo(),
+            commit: commit ?? { sha: this.run.headSha ?? '', url: pr.url },
+            summary: input.reply,
+            verify: input.checks,
+            draftReasons: input.draftReasons,
+            costUsd: this.costUsd,
+            durationMs: this.now() - this.startedAt,
+            fixRounds: this.fixRounds,
+          }),
+        );
+        const posted = await scm.commentOnPullRequest(this.settings.repo, pr.number, reply);
+        this.audit('pr_reply', posted);
+      }
+    } else if (!this.deps.store.latestEvent(this.run.id, 'final_notice')) {
       const commentId = await this.tracker.postComment(
         key,
         finalNoticeDoc(ctx, { kind: 'pr', url: pr.url, draft }),
@@ -1405,7 +1696,7 @@ class TicketRun {
       remove: [config.jira.labels.working],
     });
     const transition = config.jira.transitions.in_review;
-    if (transition && !(await this.tracker.transition(key, transition))) {
+    if (!this.followUp && transition && !(await this.tracker.transition(key, transition))) {
       this.log.warn(`No "${transition}" transition is available on ${key}.`);
     }
 
@@ -1439,13 +1730,102 @@ class TicketRun {
       };
     }
 
-    // F2: park the sandbox while the PR is in review.
-    if (this.sandbox) {
-      if (this.deps.sandboxes.capabilities.pause) await this.sandbox.pause();
-      else await this.sandbox.destroy();
-    }
-    this.update({ state: 'in_review', costUsd: this.costUsd ?? null, turns: this.turns ?? null });
+    await this.park();
+    this.update({
+      state: 'in_review',
+      costUsd: this.costUsd ?? null,
+      turns: this.turns ?? null,
+      prState: 'open',
+      // Feedback older than this run's pull request is not for it (F1).
+      prSeen:
+        this.run.prSeen ?? JSON.stringify({ at: new Date(this.now()).toISOString(), ids: [] }),
+    });
     return { outcome: 'pr', run: this.run, pr, draftReasons: input.draftReasons };
+  }
+
+  /** F2: park the sandbox while the PR is in review, so a follow-up can resume it. */
+  private async park(): Promise<void> {
+    if (!this.sandbox) return;
+    if (this.deps.sandboxes.capabilities.pause) await this.sandbox.pause();
+    else {
+      await this.sandbox.destroy();
+      this.sandbox = undefined;
+      this.update({ sandboxId: null });
+    }
+  }
+
+  /** What every run on this pull request cost, for its body. */
+  private pullRequestTotal(): { total?: { costUsd: number; runs: number } } {
+    const number = this.run.prNumber;
+    if (number === null) return {};
+    const others = this.deps.store
+      .listRuns({ ticketKey: this.run.ticketKey, limit: 200 })
+      .filter((run) => run.prNumber === number && run.id !== this.run.id);
+    if (others.length === 0) return {};
+    const costUsd = others.reduce((sum, run) => sum + (run.costUsd ?? 0), this.costUsd ?? 0);
+    return { total: { costUsd, runs: others.length + 1 } };
+  }
+
+  /** The newest saved result of this ticket's pull request, for its status comment. */
+  private latestOutcome(): Outcome | undefined {
+    for (const run of this.deps.store.listRuns({ ticketKey: this.run.ticketKey, limit: 50 })) {
+      const outcome = this.deps.store.latestEvent<Outcome>(run.id, 'outcome');
+      if (outcome) return outcome;
+    }
+    return undefined;
+  }
+
+  /** Put the pull request's result back on the status comment after a follow-up. */
+  private async restoreStatus(ctx: RunContext, note?: string): Promise<void> {
+    const outcome = this.latestOutcome();
+    if (!this.statusCommentId || !outcome) return;
+    try {
+      await this.tracker.updateComment(
+        this.run.ticketKey,
+        this.statusCommentId,
+        resultDoc(ctx, outcome, note ? { note } : {}),
+      );
+    } catch (error) {
+      this.log.warn(`Could not update the status comment: ${(error as Error).message}`);
+    }
+  }
+
+  /** A follow-up that changed nothing answers on the pull request and waits again. */
+  private async followUpNoChanges(ctx: RunContext, finalText: string): Promise<RunResult> {
+    const report = parseAgentReport(finalText);
+    const message = cleanAgentText(
+      report?.reply || report?.summary || stripReport(finalText),
+      1_500,
+    );
+    const number = this.run.prNumber;
+    if (
+      !this.request.dryRun &&
+      number !== null &&
+      !this.deps.store.latestEvent(this.run.id, 'pr_reply')
+    ) {
+      const reply = docToMarkdown(
+        followUpNoChangesDoc(ctx, {
+          ...this.replyInfo(),
+          message,
+          costUsd: this.costUsd,
+          durationMs: this.now() - this.startedAt,
+          fixRounds: this.fixRounds,
+        }),
+      );
+      const posted = await this.deps.scm.commentOnPullRequest(this.settings.repo, number, reply);
+      this.audit('pr_reply', posted);
+    }
+    await this.restoreStatus(ctx);
+    await this.park();
+    this.log.step('The agent changed nothing and answered on the pull request.');
+    this.update({
+      state: 'in_review',
+      headSha: this.base?.sha ?? null,
+      costUsd: this.costUsd ?? null,
+      turns: this.turns ?? null,
+      prState: 'open',
+    });
+    return { outcome: 'no_changes', run: this.run };
   }
 
   // -------------------------------------------------------------------------
@@ -1486,7 +1866,8 @@ class TicketRun {
         promptFile: files.prompt,
         systemPromptFile: files.system,
         sessionId: input.sessionId,
-        resume: round > 0,
+        // Fix rounds continue the session; so does a follow-up in its resumed sandbox.
+        resume: round > 0 || this.resumeSession,
         maxTurns: turnsLeft,
         maxBudgetUsd: budget,
         ...(config.agent.model ? { model: config.agent.model } : {}),
@@ -1522,14 +1903,17 @@ class TicketRun {
     });
     if (watch.stopped === 'detached') throw new RunDetachedError();
     const result = watch.result;
-    // Cost is the session total so far; turns are this round's only (see AgentEvent).
-    if (result?.costUsd !== undefined) this.costUsd = this.priorCostUsd + result.costUsd;
+    // Cost is the session total so far; turns are this round's only (see AgentEvent). A
+    // resumed session's total includes what earlier runs spent, which they already count.
+    if (result?.costUsd !== undefined)
+      this.costUsd = this.priorCostUsd + Math.max(0, result.costUsd - this.sessionBaseCostUsd);
     if (result?.turns !== undefined) this.turns = (this.turns ?? 0) + result.turns;
     this.audit('agent_exit', {
       round,
       stopped: watch.stopped,
       exitCode: watch.exitCode,
       outcome: result?.outcome,
+      ...(result?.costUsd !== undefined ? { sessionCostUsd: result.costUsd } : {}),
       stderr: tail(watch.stderr, 30),
       ...(result?.text ? { text: result.text.slice(0, 50_000) } : {}),
     });
@@ -1714,7 +2098,9 @@ class TicketRun {
       ...(err instanceof StepFailedError ? { step: err.step, logTail } : {}),
     });
 
-    if (this.ticket && this.statusCommentId) {
+    if (this.followUp && this.ticket) {
+      await this.followUpFailed(reason, cancelled);
+    } else if (this.ticket && this.statusCommentId) {
       const ctx = this.context();
       const key = this.run.ticketKey;
       const labels = this.deps.config.jira.labels;
@@ -1762,10 +2148,37 @@ class TicketRun {
     return { outcome: 'failed', run: this.run, error: err };
   }
 
+  /**
+   * A follow-up that failed leaves the pull request as it was: it says so on the PR,
+   * and the ticket's status comment shows the PR's result again with a note.
+   */
+  private async followUpFailed(reason: string, cancelled: boolean): Promise<void> {
+    const ctx = this.context();
+    const reply = this.replyInfo();
+    const what = reply.kind === 'ci' ? 'CI fix' : 'follow-up';
+    await this.restoreStatus(
+      ctx,
+      `A ${what} on the pull request ${cancelled ? 'was stopped' : 'stopped'}: ${reason}`,
+    );
+    const number = this.run.prNumber;
+    if (this.request.dryRun || number === null) return;
+    try {
+      await this.deps.scm.commentOnPullRequest(
+        this.settings.repo,
+        number,
+        docToMarkdown(followUpFailedDoc(ctx, { ...reply, reason, cancelled })),
+      );
+    } catch (error) {
+      this.log.warn(`Could not reply on the pull request: ${(error as Error).message}`);
+    }
+  }
+
   // -------------------------------------------------------------------------
 
   private context(): RunContext {
-    const by = parseTriggerInfo(this.run.triggerInfo)?.by;
+    const trigger = parseTriggerInfo(this.run.triggerInfo);
+    // A follow-up's trigger is a GitHub user, who has no Jira account to mention.
+    const by = trigger?.source === 'review' || trigger?.source === 'ci' ? undefined : trigger?.by;
     return {
       ticket: this.ticket as TicketSnapshot,
       runId: this.run.id,

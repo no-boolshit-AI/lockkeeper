@@ -121,13 +121,20 @@ function runLine(
   return `Run: ${formatDuration(outcome.durationMs)} · ${formatCost(outcome.costUsd)} · ${ctx.agentName} · ${rounds} · ${ctx.runId}`;
 }
 
-export function resultDoc(ctx: RunContext, outcome: Outcome): Doc {
-  const status = outcome.pr.draft ? 'draft pull request, needs a person' : 'ready for review';
+export function resultDoc(
+  ctx: RunContext,
+  outcome: Outcome,
+  options: { status?: string; note?: string } = {},
+): Doc {
+  const status =
+    options.status ??
+    (outcome.pr.draft ? 'draft pull request, needs a person' : 'ready for review');
   const doc: Doc = [
     header(ctx, status),
     paragraph(text('PR: '), link(outcome.pr.url, outcome.pr.url)),
-    paragraph(text('Branch: '), code(outcome.branch)),
   ];
+  if (options.note) doc.push(paragraph(options.note));
+  doc.push(paragraph(text('Branch: '), code(outcome.branch)));
   if (outcome.summary) doc.push(paragraph(outcome.summary));
   if (outcome.criteria.length > 0) {
     doc.push(paragraph(bold('Acceptance criteria')));
@@ -150,6 +157,28 @@ export function resultDoc(ctx: RunContext, outcome: Outcome): Doc {
   }
   doc.push(paragraph(runLine(ctx, outcome)));
   return doc;
+}
+
+/**
+ * F2: the status comment once the pull request is merged or closed. The run's result
+ * stays, under a status that says how it ended.
+ */
+export function closedOutDoc(
+  ctx: RunContext,
+  outcome: Outcome | undefined,
+  closed: { merged: boolean; url: string },
+): Doc {
+  const status = closed.merged ? 'merged' : 'closed without merging';
+  const note = closed.merged
+    ? 'The pull request was merged. Its sandbox was deleted.'
+    : 'The pull request was closed without merging. Its sandbox was deleted.';
+  if (outcome) return resultDoc(ctx, outcome, { status, note });
+  return [
+    header(ctx, status),
+    paragraph(text('PR: '), link(closed.url, closed.url)),
+    paragraph(note),
+    paragraph(`Run ${ctx.runId}`),
+  ];
 }
 
 export function noChangesDoc(
@@ -304,19 +333,21 @@ export function refusedDoc(key: string, reason: string, hint?: string): Doc {
   return doc;
 }
 
-/** The status comment for a run waiting for a free slot (T1: feedback within a minute). */
+/**
+ * The status comment for a run that waits before it starts: for a free slot, or under
+ * the daily or open-PR caps (T1: feedback within a minute).
+ */
 export function queuedDoc(input: {
   key: string;
   runId: string;
-  slots: number;
+  /** Why it waits and until when, in one or two sentences. */
+  waiting: string;
   agentName: string;
   limits: RunContext['limits'];
 }): Doc {
   return [
     paragraph(bold('Lockkeeper'), ` · ${input.key} · queued`),
-    paragraph(
-      `Picked up. All ${input.slots} run slots are busy, so this run starts when one is free. This comment is updated as the run goes.`,
-    ),
+    paragraph(`Picked up. ${input.waiting} This comment is updated as the run goes.`),
     paragraph(
       `Run ${input.runId} · ${input.agentName} · limits: ${formatCost(input.limits.costUsd)}, ${input.limits.minutes} min`,
     ),
@@ -350,6 +381,8 @@ export interface PullRequestBodyInput {
   fixRounds: number;
   /** Bug fixes: whether the new tests fail without the fix (E5). */
   proof?: FailingTestProof;
+  /** What every run on this pull request cost together, once there is more than one. */
+  total?: { costUsd: number; runs: number };
 }
 
 const MAX_PR_BODY = 60_000;
@@ -473,12 +506,121 @@ export function pullRequestBodyDoc(input: PullRequestBodyInput): Doc {
 
   doc.push(heading(1, 'Run'));
   doc.push(paragraph(runLine(ctx, input)));
+  if (input.total && input.total.runs > 1) {
+    doc.push(
+      paragraph(
+        `All ${input.total.runs} runs on this pull request: ${formatCost(input.total.costUsd)}.`,
+      ),
+    );
+  }
   doc.push(
     paragraph(
       'Opened by Lockkeeper. The agent worked in a sealed sandbox with no write access; Lockkeeper checked the diff and created this commit. Lockkeeper never merges.',
     ),
   );
   return doc;
+}
+
+// ---------------------------------------------------------------------------
+// Replies on the pull request (F1). Reviewers stay in GitHub, so follow-ups answer there.
+
+export type FollowUpKind = 'review' | 'ci';
+
+/** Whose feedback a follow-up answers, in words: "the review by alice and bob". */
+function feedbackFrom(kind: FollowUpKind, authors: readonly string[], checks: readonly string[]) {
+  if (kind === 'ci') {
+    const names = checks.slice(0, 5).join(', ');
+    return `the failed CI checks${names ? ` (${names}${checks.length > 5 ? ', …' : ''})` : ''}`;
+  }
+  const people = authors.length === 0 ? 'a reviewer' : authors.slice(0, 5).join(', ');
+  return `the feedback from ${people}`;
+}
+
+function followUpHeader(round: number, rounds: number, kind: FollowUpKind): Doc[number] {
+  const what = kind === 'ci' ? 'CI fix' : 'follow-up';
+  return paragraph(bold('Lockkeeper'), ` · ${what} ${round} of ${rounds}`);
+}
+
+export interface FollowUpReply {
+  kind: FollowUpKind;
+  round: number;
+  rounds: number;
+  /** GitHub logins whose feedback this answers. */
+  authors: string[];
+  /** CI follow-ups: the checks that failed. */
+  checks?: string[];
+}
+
+export function followUpReplyDoc(
+  ctx: RunContext,
+  reply: FollowUpReply & {
+    commit: { sha: string; url: string };
+    summary: string;
+    verify: CheckResult[];
+    draftReasons: string[];
+    costUsd: number | undefined;
+    durationMs: number;
+    fixRounds: number;
+  },
+): Doc {
+  const doc: Doc = [
+    followUpHeader(reply.round, reply.rounds, reply.kind),
+    paragraph(
+      text('Pushed '),
+      link(reply.commit.sha.slice(0, 7), reply.commit.url),
+      text(` for ${feedbackFrom(reply.kind, reply.authors, reply.checks ?? [])}.`),
+    ),
+  ];
+  if (reply.summary) doc.push(paragraph(reply.summary));
+  doc.push(paragraph(...checksLine(reply.verify)));
+  if (reply.draftReasons.length > 0) {
+    doc.push(paragraph(bold('Kept as a draft because')));
+    doc.push(bullets(...reply.draftReasons));
+  }
+  doc.push(paragraph(runLine(ctx, reply)));
+  return doc;
+}
+
+export function followUpNoChangesDoc(
+  ctx: RunContext,
+  reply: FollowUpReply & {
+    message: string;
+    costUsd: number | undefined;
+    durationMs: number;
+    fixRounds: number;
+  },
+): Doc {
+  const doc: Doc = [
+    followUpHeader(reply.round, reply.rounds, reply.kind),
+    paragraph(
+      `No code change for ${feedbackFrom(reply.kind, reply.authors, reply.checks ?? [])}.${reply.message ? ' The agent said:' : ''}`,
+    ),
+  ];
+  if (reply.message) doc.push(paragraph(reply.message));
+  doc.push(paragraph(runLine(ctx, reply)));
+  return doc;
+}
+
+export function followUpFailedDoc(
+  ctx: RunContext,
+  reply: FollowUpReply & { reason: string; cancelled: boolean },
+): Doc {
+  return [
+    followUpHeader(reply.round, reply.rounds, reply.kind),
+    paragraph(
+      `The ${reply.kind === 'ci' ? 'CI fix' : 'follow-up'} for ${feedbackFrom(reply.kind, reply.authors, reply.checks ?? [])} ${reply.cancelled ? 'was stopped' : 'stopped'}: ${reply.reason} Nothing was pushed.`,
+    ),
+    paragraph(`Run ${ctx.runId}`),
+  ];
+}
+
+/** Said once when feedback arrives after the follow-up rounds are used up. */
+export function roundsUsedDoc(input: { kind: FollowUpKind; rounds: number }): Doc {
+  const what =
+    input.kind === 'ci'
+      ? `CI still fails, and Lockkeeper already made ${input.rounds} CI fix ${input.rounds === 1 ? 'round' : 'rounds'} on this pull request, the limit (ci.fix_rounds in lockkeeper.yml). The checks need a person.`
+      : `Lockkeeper already made ${input.rounds} follow-up ${input.rounds === 1 ? 'round' : 'rounds'} on this pull request, the limit (review.rounds in lockkeeper.yml). Push the change yourself, or raise the limit.`;
+  return [paragraph(bold('Lockkeeper'), ' · no follow-up'), paragraph(what)];
 }
 
 export function capPullRequestBody(markdown: string): string {

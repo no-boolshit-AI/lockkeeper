@@ -5,12 +5,19 @@ import {
   type BaseRef,
   type BranchHead,
   type BranchRule,
+  type CheckFailure,
+  type CheckStatus,
   type CloneAccess,
   type CommitInput,
   type CommitResult,
+  type PermissionNeeds,
   type PullRequest,
+  type PullRequestFeedback,
   type PullRequestInput,
+  type PullRequestStatus,
   parseRepo,
+  REQUIRED_PERMISSIONS,
+  type RepoPermission,
   type SourceControl,
 } from '../scm.js';
 
@@ -33,6 +40,93 @@ function statusOf(error: unknown): number | undefined {
     : undefined;
 }
 
+interface PullData {
+  number: number;
+  state: string;
+  merged_at?: string | null;
+  updated_at: string;
+  head: { sha: string };
+  draft?: boolean;
+}
+
+interface UserData {
+  login?: string;
+  type?: string;
+}
+
+interface CheckRunData {
+  id: number;
+  name: string;
+  status: string;
+  conclusion: string | null;
+  html_url?: string | null;
+  details_url?: string | null;
+  app?: { slug?: string } | null;
+  output?: {
+    title?: string | null;
+    summary?: string | null;
+    text?: string | null;
+    annotations_count?: number;
+  };
+}
+
+interface StatusData {
+  context: string;
+  state: string;
+  description?: string | null;
+  target_url?: string | null;
+}
+
+const REVIEW_STATES: Record<string, PullRequestFeedback['reviewState']> = {
+  CHANGES_REQUESTED: 'changes_requested',
+  COMMENTED: 'commented',
+  APPROVED: 'approved',
+  DISMISSED: 'dismissed',
+};
+
+const ROLES: Record<string, RepoPermission> = {
+  admin: 'admin',
+  maintain: 'maintain',
+  write: 'write',
+  push: 'write',
+  triage: 'triage',
+  read: 'read',
+  pull: 'read',
+  none: 'none',
+};
+
+/** Check conclusions that mean the code is at fault. Cancelled runs are left alone. */
+const FAILED_CONCLUSIONS = new Set(['failure', 'timed_out', 'startup_failure']);
+
+function capText(value: string, max: number): string {
+  return value.length <= max ? value : `${value.slice(0, max)}\n[… cut]`;
+}
+
+function toStatus(pr: PullData): PullRequestStatus {
+  return {
+    number: pr.number,
+    state: pr.merged_at ? 'merged' : pr.state === 'closed' ? 'closed' : 'open',
+    updatedAt: pr.updated_at,
+    headSha: pr.head.sha,
+    draft: Boolean(pr.draft),
+  };
+}
+
+function authorOf(user: UserData | null | undefined): PullRequestFeedback['author'] {
+  return { login: user?.login ?? 'ghost', bot: user?.type === 'Bot' };
+}
+
+/** The end of a GitHub Actions job log, without colour codes and timestamps. */
+export function logTail(log: string, maxLines = 120, maxChars = 6_000): string {
+  const lines = log
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: removing terminal colour codes
+    .replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z ?/, ''));
+  const tailText = lines.slice(-maxLines).join('\n').trim();
+  return tailText.length > maxChars ? `…${tailText.slice(-maxChars)}` : tailText;
+}
+
 /**
  * GitHub behind the SourceControl interface, acting as a GitHub App.
  *
@@ -46,6 +140,8 @@ export class GitHubSourceControl implements SourceControl {
   private readonly installationIds = new Map<string, number>();
   private readonly clients = new Map<number, Octokit>();
   private appSlug: string | undefined;
+  /** ETags of polled resources: GitHub answers an unchanged one with a free 304. */
+  private readonly etags = new Map<string, { etag: string; data: unknown }>();
 
   constructor(private readonly options: GitHubOptions) {
     this.appClient = this.octokit({ appId: options.appId, privateKey: options.privateKey });
@@ -172,16 +268,14 @@ export class GitHubSourceControl implements SourceControl {
     }
   }
 
-  async missingPermissions(repo: string): Promise<string[]> {
+  async missingPermissions(
+    repo: string,
+    needed: PermissionNeeds = REQUIRED_PERMISSIONS,
+  ): Promise<string[]> {
     const { owner, name } = parseRepo(repo);
     await this.installationId(repo);
     const { data } = await this.appClient.rest.apps.getRepoInstallation({ owner, repo: name });
     const granted = (data.permissions ?? {}) as Record<string, string | undefined>;
-    const needed: Record<string, 'read' | 'write'> = {
-      metadata: 'read',
-      contents: 'write',
-      pull_requests: 'write',
-    };
     return Object.entries(needed)
       .filter(([permission, level]) => {
         const has = granted[permission];
@@ -367,5 +461,299 @@ export class GitHubSourceControl implements SourceControl {
     return pr
       ? { number: pr.number, url: pr.html_url, draft: Boolean(pr.draft), state: pr.state }
       : undefined;
+  }
+
+  /**
+   * A polled GET that sends the last ETag. Unchanged answers come back as 304, which
+   * does not count against GitHub's rate limit.
+   */
+  private async conditionalGet<T>(
+    client: Octokit,
+    route: string,
+    params: Record<string, unknown>,
+  ): Promise<T> {
+    const key = `${route} ${JSON.stringify(params)}`;
+    const cached = this.etags.get(key);
+    const request = client.request as unknown as (
+      route: string,
+      params: Record<string, unknown>,
+    ) => Promise<{ data: unknown; headers: Record<string, string | undefined> }>;
+    try {
+      const response = await request(route, {
+        ...params,
+        ...(cached ? { headers: { 'if-none-match': cached.etag } } : {}),
+      });
+      const etag = response.headers.etag;
+      if (etag) {
+        this.etags.delete(key);
+        this.etags.set(key, { etag, data: response.data });
+        if (this.etags.size > 1_000) {
+          const oldest = this.etags.keys().next().value;
+          if (oldest !== undefined) this.etags.delete(oldest);
+        }
+      }
+      return response.data as T;
+    } catch (error) {
+      if (statusOf(error) === 304 && cached) return cached.data as T;
+      throw error;
+    }
+  }
+
+  async pullRequestStatuses(
+    repo: string,
+    numbers: number[],
+  ): Promise<Map<number, PullRequestStatus>> {
+    const { owner, name } = parseRepo(repo);
+    const client = await this.client(repo);
+    const found = new Map<number, PullRequestStatus>();
+    for (const number of new Set(numbers)) {
+      try {
+        const pr = await this.conditionalGet<PullData>(
+          client,
+          'GET /repos/{owner}/{repo}/pulls/{pull_number}',
+          { owner, repo: name, pull_number: number },
+        );
+        found.set(number, toStatus(pr));
+      } catch (error) {
+        if (statusOf(error) !== 404) throw error;
+      }
+    }
+    return found;
+  }
+
+  async pullRequestFeedback(
+    repo: string,
+    number: number,
+    since: string,
+  ): Promise<PullRequestFeedback[]> {
+    const { owner, name } = parseRepo(repo);
+    const client = await this.client(repo);
+    const sinceMs = Date.parse(since);
+    // Edits bring old comments back into `since` results: only new ones count.
+    const isNew = (iso: string | null | undefined): iso is string =>
+      typeof iso === 'string' && Date.parse(iso) >= sinceMs;
+    const feedback: PullRequestFeedback[] = [];
+
+    const reviews = await client.paginate(client.rest.pulls.listReviews, {
+      owner,
+      repo: name,
+      pull_number: number,
+      per_page: 100,
+    });
+    for (const review of reviews) {
+      const state = REVIEW_STATES[review.state];
+      if (!state || !isNew(review.submitted_at)) continue;
+      feedback.push({
+        id: `review:${review.id}`,
+        kind: 'review',
+        author: authorOf(review.user),
+        reviewState: state,
+        body: review.body ?? '',
+        url: review.html_url,
+        createdAt: review.submitted_at,
+      });
+    }
+    const inline = await client.paginate(client.rest.pulls.listReviewComments, {
+      owner,
+      repo: name,
+      pull_number: number,
+      since,
+      per_page: 100,
+    });
+    for (const comment of inline) {
+      if (!isNew(comment.created_at)) continue;
+      const line = comment.line ?? comment.original_line;
+      feedback.push({
+        id: `inline:${comment.id}`,
+        kind: 'inline',
+        author: authorOf(comment.user),
+        body: comment.body,
+        path: comment.path,
+        ...(typeof line === 'number' ? { line } : {}),
+        ...(comment.pull_request_review_id
+          ? { reviewId: `review:${comment.pull_request_review_id}` }
+          : {}),
+        url: comment.html_url,
+        createdAt: comment.created_at,
+      });
+    }
+    const comments = await client.paginate(client.rest.issues.listComments, {
+      owner,
+      repo: name,
+      issue_number: number,
+      since,
+      per_page: 100,
+    });
+    for (const comment of comments) {
+      if (!isNew(comment.created_at)) continue;
+      feedback.push({
+        id: `comment:${comment.id}`,
+        kind: 'comment',
+        author: authorOf(comment.user),
+        body: comment.body ?? '',
+        url: comment.html_url,
+        createdAt: comment.created_at,
+      });
+    }
+    return feedback.sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+  }
+
+  async repositoryPermission(repo: string, login: string): Promise<RepoPermission> {
+    const { owner, name } = parseRepo(repo);
+    const client = await this.client(repo);
+    try {
+      const { data } = await client.rest.repos.getCollaboratorPermissionLevel({
+        owner,
+        repo: name,
+        username: login,
+      });
+      const role = (data as { role_name?: string }).role_name ?? data.permission;
+      return ROLES[role] ?? 'none';
+    } catch (error) {
+      if (statusOf(error) === 404) return 'none';
+      throw error;
+    }
+  }
+
+  async commentOnPullRequest(
+    repo: string,
+    number: number,
+    body: string,
+  ): Promise<{ id: string; url: string }> {
+    const { owner, name } = parseRepo(repo);
+    const client = await this.client(repo);
+    const { data } = await client.rest.issues.createComment({
+      owner,
+      repo: name,
+      issue_number: number,
+      body,
+    });
+    return { id: String(data.id), url: data.html_url };
+  }
+
+  async acknowledge(repo: string, feedback: PullRequestFeedback): Promise<void> {
+    const { owner, name } = parseRepo(repo);
+    const id = Number(feedback.id.slice(feedback.id.indexOf(':') + 1));
+    if (!Number.isSafeInteger(id)) return;
+    try {
+      const client = await this.client(repo);
+      if (feedback.kind === 'comment') {
+        await client.rest.reactions.createForIssueComment({
+          owner,
+          repo: name,
+          comment_id: id,
+          content: 'eyes',
+        });
+      } else if (feedback.kind === 'inline') {
+        await client.rest.reactions.createForPullRequestReviewComment({
+          owner,
+          repo: name,
+          comment_id: id,
+          content: 'eyes',
+        });
+      }
+      // Reviews take no reactions; the reply comes when the follow-up finishes.
+    } catch {
+      // Best effort: a missing reaction changes nothing about the run.
+    }
+  }
+
+  async checkStatus(
+    repo: string,
+    sha: string,
+    options: { details?: boolean } = {},
+  ): Promise<CheckStatus> {
+    if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error(`Not a commit SHA: ${sha}`);
+    const { owner, name } = parseRepo(repo);
+    const client = await this.client(repo);
+    const runs = await this.conditionalGet<{ check_runs: CheckRunData[] }>(
+      client,
+      'GET /repos/{owner}/{repo}/commits/{ref}/check-runs',
+      { owner, repo: name, ref: sha, per_page: 100, filter: 'latest' },
+    );
+    const combined = await this.conditionalGet<{ statuses: StatusData[] }>(
+      client,
+      'GET /repos/{owner}/{repo}/commits/{ref}/status',
+      { owner, repo: name, ref: sha, per_page: 100 },
+    );
+    let pending = false;
+    const failures: { failure: CheckFailure; run?: CheckRunData }[] = [];
+    for (const run of runs.check_runs) {
+      if (run.status !== 'completed') {
+        pending = true;
+        continue;
+      }
+      if (run.conclusion && FAILED_CONCLUSIONS.has(run.conclusion)) {
+        const url = run.html_url ?? run.details_url;
+        failures.push({
+          failure: { name: run.name, conclusion: run.conclusion, ...(url ? { url } : {}) },
+          run,
+        });
+      }
+    }
+    for (const status of combined.statuses) {
+      if (status.state === 'pending') pending = true;
+      else if (status.state === 'failure' || status.state === 'error') {
+        failures.push({
+          failure: {
+            name: status.context,
+            conclusion: status.state,
+            ...(status.target_url ? { url: status.target_url } : {}),
+            details: status.description ?? '',
+          },
+        });
+      }
+    }
+    const reported = runs.check_runs.length + combined.statuses.length;
+    const state: CheckStatus['state'] =
+      reported === 0 ? 'none' : pending ? 'pending' : failures.length > 0 ? 'failure' : 'success';
+    if (options.details && state === 'failure') {
+      for (const entry of failures) {
+        if (entry.run)
+          entry.failure.details = await this.checkRunDetails(client, owner, name, entry.run);
+      }
+    }
+    return { state, failures: failures.map((entry) => entry.failure) };
+  }
+
+  /** What a failed check says: its summary, annotations and, for Actions, the log's end. */
+  private async checkRunDetails(
+    client: Octokit,
+    owner: string,
+    repo: string,
+    run: CheckRunData,
+  ): Promise<string> {
+    const parts: string[] = [];
+    if (run.output?.title) parts.push(run.output.title);
+    if (run.output?.summary) parts.push(capText(run.output.summary, 2_000));
+    if (run.output?.text) parts.push(capText(run.output.text, 2_000));
+    try {
+      if (run.output?.annotations_count) {
+        const { data } = await client.rest.checks.listAnnotations({
+          owner,
+          repo,
+          check_run_id: run.id,
+          per_page: 30,
+        });
+        const lines = data.map(
+          (annotation) =>
+            `${annotation.path}:${annotation.start_line}: ${annotation.annotation_level}: ${annotation.message ?? ''}`,
+        );
+        if (lines.length > 0) parts.push(lines.join('\n'));
+      }
+      if (run.app?.slug === 'github-actions') {
+        // For Actions, a check run's ID is its job's ID. GitHub redirects to the log.
+        const response = await client.rest.actions.downloadJobLogsForWorkflowRun({
+          owner,
+          repo,
+          job_id: run.id,
+        });
+        const log = typeof response.data === 'string' ? response.data : '';
+        if (log) parts.push(`End of the job log:\n${logTail(log)}`);
+      }
+    } catch {
+      // Details are a help, not a requirement: the check's name and result still count.
+    }
+    return capText(parts.join('\n\n'), 8_000);
   }
 }

@@ -58,6 +58,7 @@ describe('lockkeeper doctor', () => {
       'Jira account',
       'Jira project DEMO',
       'GitHub acme/demo',
+      'CI access in acme/demo',
       'Branch rules in acme/demo',
       'Model key',
       'Sandbox for acme/demo',
@@ -102,6 +103,20 @@ describe('lockkeeper doctor', () => {
       detail: 'the GitHub App lacks pull_requests: write',
     });
     expect(checks.has('Sandbox for acme/demo')).toBe(false);
+  });
+
+  it('warns when the App cannot see CI results, which CI fix rounds need', async () => {
+    const s = setup();
+    root = s.root;
+    s.scm.missingCi = ['checks: read', 'actions: read'];
+    const checks = byName(await runDoctor(s.deps));
+    expect(checks.get('CI access in acme/demo')).toMatchObject({
+      status: 'warn',
+      detail: 'CI fix rounds need checks: read, actions: read',
+      fix: expect.stringContaining('ci.fix_rounds: 0'),
+    });
+    // Everything else still runs.
+    expect(checks.get('Sandbox for acme/demo')?.status).toBe('ok');
   });
 
   it('warns, with the log, when the checks already fail on the base branch', async () => {

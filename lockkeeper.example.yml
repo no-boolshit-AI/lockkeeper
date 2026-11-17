@@ -24,6 +24,7 @@ jira:
   # acceptance_criteria_field: Acceptance Criteria
   # transitions:
   #   in_review: In Review
+  #   merged: Done
 
 github:
   # The GitHub App Lockkeeper acts as. Or set LOCKKEEPER_GITHUB_APP_ID.
@@ -41,6 +42,9 @@ projects:
     #   repo-web: acme/web
     # Per-project overrides of the repo block below:
     # verify: [npm run lint, npm test]
+    # Per-project review settings:
+    # review:
+    #   changes_requested: false
 
 agent:
   use: claude-code
@@ -59,6 +63,8 @@ sandbox:
   allow_domains: []
   # Close GitHub to the agent once setup is done. Setup can still fetch git dependencies.
   close_github_after_setup: false
+  # A paused sandbox whose pull request sees no activity for this long is deleted.
+  idle_days: 14
 
 limits:
   cost_usd: 10
@@ -68,6 +74,23 @@ limits:
   max_added_lines: 500
   max_changed_files: 60
   parallel_runs: 3
+  # New tickets wait while this many Lockkeeper pull requests are open in a repository.
+  open_prs_per_repo: 10
+  # Runs wait while this many started in the last 24 hours, follow-ups included.
+  runs_per_day: 40
+
+# Follow-ups on Lockkeeper's pull requests. People with write access request changes
+# in a review, or comment /agent and what they want. /agent stop stops a follow-up.
+review:
+  enabled: true
+  rounds: 2
+  # Every changes-requested review starts a follow-up, not only /agent comments.
+  changes_requested: true
+
+# When CI fails on Lockkeeper's own commit, the agent gets the failures and fixes them.
+# Needs the GitHub App's Checks, Commit statuses and Actions read permissions.
+ci:
+  fix_rounds: 2
 
 # A short read-only check before any code is written. It asks questions on the ticket
 # when something essential is missing, and declines tickets that are not code changes.

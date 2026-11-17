@@ -4,7 +4,7 @@ Lockkeeper turns a labelled Jira ticket into a reviewable GitHub pull request. A
 
 It is for Jira Cloud teams that want agent delivery on their own terms: their keys, their choice of agent and model, per-project rules, and code they can read. No Jira admin rights, no Marketplace app, no public URL.
 
-> **Status: pre-alpha, heading for a private alpha (milestone M2).** `lockkeeper start` watches Jira and turns labelled tickets into pull requests, with a readiness check, stop and retry from the ticket, and runs that survive restarts. The first live run, on 16 November 2026, produced [this pull request](https://github.com/no-boolshit-AI/lockkeeper-demo/pull/1) in 48 seconds. See the [roadmap](docs/ROADMAP.md) and the [PRD](docs/PRD.md).
+> **Status: pre-alpha, working towards a public beta (milestone M3).** `lockkeeper start` watches Jira and turns labelled tickets into pull requests, with a readiness check, stop and retry from the ticket, and runs that survive restarts. Reviewers stay in GitHub: requested changes and failed CI get follow-up commits on the same pull request. The first live run, on 16 November 2026, produced [this pull request](https://github.com/no-boolshit-AI/lockkeeper-demo/pull/1) in 48 seconds. See the [roadmap](docs/ROADMAP.md) and the [PRD](docs/PRD.md).
 
 ## How a run works
 
@@ -25,6 +25,8 @@ Jira ticket ──snapshot──▶ control plane ──creates──▶ E2B san
 5. **Verify.** Lockkeeper, not the agent, runs your lint and test commands. Failures go back to the agent for up to two fix rounds. For a bug, Lockkeeper also runs the agent's new tests without the fix and expects them to fail.
 6. **Publish.** The control plane reads the diff and checks it: protected paths, size, submodules, secrets. Then it creates a verified commit and the PR through the GitHub API. The PR is a draft, with the reason stated, unless every check passed and every acceptance criterion has evidence.
 7. **Report.** One status comment on the ticket, edited in place, plus a short final comment that notifies the requester, the PR as a remote link, and labels.
+8. **Review.** The sandbox is paused while the PR is in review. A changes-requested review, or a PR comment starting with `/agent`, resumes it with the same agent session, adds a commit and replies on the PR. Failed CI on Lockkeeper's commit gets up to two fix rounds on its own.
+9. **Merge.** A person merges. Lockkeeper deletes the sandbox and closes out the status comment. A PR with no activity for 14 days also loses its sandbox; a later follow-up starts a fresh one from the branch.
 
 ## Security model
 
@@ -102,6 +104,10 @@ Now adding the `agent` label to a ticket starts a run within a minute. Lockkeepe
 Before writing code, a short read-only pass checks that the ticket can be built as written. If something essential is missing, Lockkeeper asks up to five numbered questions in a comment that mentions whoever added the label, and waits. A reply starting `/agent go`, with the answers, continues the run. Tickets that are not a code change are declined with a reason. The check has its own small cost cap (`readiness` in `lockkeeper.yml`), and anything it changes is thrown away.
 
 From the ticket, people can stop a run by removing its label or by commenting `/agent stop`. They can comment `/agent retry` with a note for the agent to start another attempt. If the last run opened a pull request, the new attempt adds to that branch and updates the same pull request. Stopping the service with Ctrl-C pauses runs in progress, and `lockkeeper start` picks them up where they stopped.
+
+On the pull request, anyone with write access can request changes in a review, or comment `/agent` followed by what they want, such as `/agent rename the helper and add a test`. Lockkeeper resumes the paused sandbox and the agent's session, pushes a commit and replies with what changed. Each PR gets two follow-up rounds (`review.rounds`). `/agent stop` on the PR stops a follow-up. When CI fails on Lockkeeper's own commit, the agent gets the failed checks, their annotations and the end of each job log, for up to two rounds (`ci.fix_rounds`). Checks that also fail on the base branch are left alone.
+
+Runs wait in the queue, with the reason on the ticket, while 10 Lockkeeper pull requests are open in the repository or 40 runs started in the last 24 hours (`limits.open_prs_per_repo`, `limits.runs_per_day`).
 
 ## Commands
 

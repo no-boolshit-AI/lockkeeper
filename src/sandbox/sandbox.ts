@@ -72,13 +72,29 @@ export interface SandboxHandle {
   setEgress?(allowDomains: string[], secrets: SecretBinding[]): Promise<void>;
 }
 
+/** A sandbox as the provider lists it, without connecting to it. */
+export interface SandboxSummary {
+  id: string;
+  metadata: Record<string, string>;
+  state: 'running' | 'paused';
+  startedAt: string;
+}
+
 export interface SandboxProvider {
   readonly kind: string;
   /** The provider's name as people write it, such as E2B. */
   readonly displayName: string;
   readonly capabilities: SandboxCapabilities;
   create(spec: SandboxSpec): Promise<SandboxHandle>;
+  /** Connect to a sandbox, resuming it if it is paused. */
   connect(id: string): Promise<SandboxHandle>;
+  /**
+   * Delete a sandbox by ID without connecting, so a paused one is not resumed first.
+   * False when it no longer exists.
+   */
+  deleteSandbox(id: string): Promise<boolean>;
+  /** Sandboxes this account holds that carry `metadataKey`, running or paused. */
+  listSandboxes?(metadataKey: string): Promise<SandboxSummary[]>;
 }
 
 /** Quote a value for a POSIX shell. */

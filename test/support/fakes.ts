@@ -7,11 +7,15 @@ import { LockkeeperError } from '../../src/core/errors.js';
 import type {
   BaseRef,
   BranchHead,
+  CheckStatus,
   CloneAccess,
   CommitInput,
   CommitResult,
   PullRequest,
+  PullRequestFeedback,
   PullRequestInput,
+  PullRequestStatus,
+  RepoPermission,
   SourceControl,
 } from '../../src/scm/scm.js';
 import { RecordingTracker } from '../../src/tracker/recording-tracker.js';
@@ -93,6 +97,18 @@ export class FakeScm implements SourceControl {
   beforeWrite: ((action: 'commit' | 'pull_request') => void) | undefined;
   afterWrite: ((action: 'commit' | 'pull_request') => void) | undefined;
   private nextPr = 7;
+  /** What GitHub would say about each pull request beyond what `pullRequests` holds. */
+  readonly prStatus = new Map<number, { state: PullRequestStatus['state']; updatedAt: string }>();
+  readonly feedback = new Map<number, PullRequestFeedback[]>();
+  /** Repository access by GitHub login. Anyone not listed has none. */
+  readonly permissions: Record<string, RepoPermission> = {};
+  readonly prComments: { number: number; body: string }[] = [];
+  readonly acknowledged: string[] = [];
+  /** CI results by commit SHA, and the calls that asked for them. */
+  readonly checks = new Map<string, CheckStatus>();
+  readonly checkCalls: { sha: string; details: boolean }[] = [];
+  private stampMs = 0;
+  private nextFeedbackId = 100;
 
   /** Commits land in the bare repository for real, so a later run can clone them. */
   constructor(
@@ -147,10 +163,12 @@ export class FakeScm implements SourceControl {
 
   /** Set to make the App look under-permissioned or blocked by rules. */
   missing: string[] = [];
+  /** Missing permissions that only CI fix rounds need. */
+  missingCi: string[] = [];
   rules: { type: string }[] = [];
 
-  async missingPermissions(): Promise<string[]> {
-    return this.missing;
+  async missingPermissions(_repo: string, needed?: Record<string, string>): Promise<string[]> {
+    return needed && 'checks' in needed ? this.missingCi : this.missing;
   }
 
   async branchRules(): Promise<{ type: string }[]> {
@@ -188,6 +206,7 @@ export class FakeScm implements SourceControl {
       throw new Error(`Update is not a fast forward: ${input.branch}`);
     this.git(['update-ref', `refs/heads/${input.branch}`, sha]);
     this.commits.push(input);
+    for (const pr of this.pullRequests) if (pr.head === input.branch) this.touch(pr.number);
     this.afterWrite?.('commit');
     return { sha, url: `https://github.com/acme/demo/commit/${sha}`, verified: true };
   }
@@ -224,10 +243,115 @@ export class FakeScm implements SourceControl {
     const pr = this.pullRequests.find((entry) => entry.number === number);
     if (!pr) throw new Error(`No pull request ${number}`);
     this.updates.push({ number, ...update });
+    this.touch(number);
     if (update.title !== undefined) pr.title = update.title;
     if (update.body !== undefined) pr.body = update.body;
     if (update.draft !== undefined) pr.draft = update.draft;
     return this.toPr(pr);
+  }
+
+  /** A strictly increasing timestamp, like GitHub's updated_at after each change. */
+  private stamp(): string {
+    this.stampMs = Math.max(Date.now(), this.stampMs + 1);
+    return new Date(this.stampMs).toISOString();
+  }
+
+  private touch(number: number): void {
+    const status = this.prStatus.get(number) ?? { state: 'open' as const, updatedAt: '' };
+    status.updatedAt = this.stamp();
+    this.prStatus.set(number, status);
+  }
+
+  /** Merge or close a pull request, as a person would on GitHub. */
+  setPrState(number: number, state: PullRequestStatus['state']): void {
+    this.touch(number);
+    (this.prStatus.get(number) as { state: PullRequestStatus['state'] }).state = state;
+    const pr = this.pullRequests.find((entry) => entry.number === number);
+    if (pr) pr.state = state === 'open' ? 'open' : 'closed';
+  }
+
+  /** Someone reviews or comments on a pull request. */
+  addFeedback(
+    number: number,
+    item: Partial<PullRequestFeedback> & { body: string },
+  ): PullRequestFeedback {
+    const kind = item.kind ?? 'comment';
+    const entry: PullRequestFeedback = {
+      id: `${kind}:${this.nextFeedbackId++}`,
+      kind,
+      author: { login: 'alice', bot: false },
+      url: `https://github.com/acme/demo/pull/${number}#feedback`,
+      createdAt: new Date().toISOString(),
+      ...item,
+    };
+    this.feedback.set(number, [...(this.feedback.get(number) ?? []), entry]);
+    this.touch(number);
+    return entry;
+  }
+
+  async pullRequestStatuses(
+    _repo: string,
+    numbers: number[],
+  ): Promise<Map<number, PullRequestStatus>> {
+    const found = new Map<number, PullRequestStatus>();
+    for (const number of numbers) {
+      const pr = this.pullRequests.find((entry) => entry.number === number);
+      if (!pr) continue;
+      const status = this.prStatus.get(number);
+      found.set(number, {
+        number,
+        state: status?.state ?? 'open',
+        updatedAt: status?.updatedAt ?? 'initial',
+        headSha: this.ref(pr.head) ?? '',
+        draft: pr.draft,
+      });
+    }
+    return found;
+  }
+
+  async pullRequestFeedback(
+    _repo: string,
+    number: number,
+    since: string,
+  ): Promise<PullRequestFeedback[]> {
+    const sinceMs = Date.parse(since);
+    return (this.feedback.get(number) ?? []).filter(
+      (entry) => Date.parse(entry.createdAt) >= sinceMs,
+    );
+  }
+
+  async repositoryPermission(_repo: string, login: string): Promise<RepoPermission> {
+    return this.permissions[login] ?? 'none';
+  }
+
+  async commentOnPullRequest(
+    _repo: string,
+    number: number,
+    body: string,
+  ): Promise<{ id: string; url: string }> {
+    this.prComments.push({ number, body });
+    this.touch(number);
+    const id = String(this.nextFeedbackId++);
+    return { id, url: `https://github.com/acme/demo/pull/${number}#issuecomment-${id}` };
+  }
+
+  async acknowledge(_repo: string, feedback: PullRequestFeedback): Promise<void> {
+    this.acknowledged.push(feedback.id);
+  }
+
+  async checkStatus(
+    _repo: string,
+    sha: string,
+    options: { details?: boolean } = {},
+  ): Promise<CheckStatus> {
+    this.checkCalls.push({ sha, details: options.details === true });
+    const status = this.checks.get(sha) ?? { state: 'none', failures: [] };
+    return options.details
+      ? status
+      : {
+          state: status.state,
+          failures: status.failures.map(({ details: _details, ...rest }) => rest),
+        };
   }
 }
 
