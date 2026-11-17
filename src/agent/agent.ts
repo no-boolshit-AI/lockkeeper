@@ -10,6 +10,11 @@ export type AgentEvent =
   | { type: 'tool_call'; id?: string; tool: string; summary: string }
   | { type: 'tool_result'; id?: string; isError: boolean }
   | { type: 'retry'; attempt: number; error?: string }
+  /**
+   * What this invocation has used so far, for agents whose CLI has no caps of its own:
+   * Lockkeeper stops the agent when either passes the run's cap.
+   */
+  | { type: 'usage'; costUsd?: number; turns?: number }
   | {
       type: 'result';
       ok: boolean;
@@ -74,12 +79,30 @@ export interface SandboxRequirement {
   hint: string;
 }
 
+/**
+ * Reads one invocation's output line by line. Some CLIs spread what Lockkeeper needs
+ * over several lines, such as a final message and a later usage line, so a parser
+ * keeps state. A new one is made for each invocation, and for each reattach.
+ */
+export interface AgentParser {
+  parse(line: string): AgentEvent[];
+  /** Called once when the process has exited, for CLIs that print no result line. */
+  end?(exitCode: number | null): AgentEvent[];
+}
+
 export interface AgentAdapter {
   readonly id: string;
   readonly displayName: string;
   readonly credential: AgentCredential;
   /** Hosts the agent needs besides its model API, if any. */
   readonly extraDomains: readonly string[];
+  /** The sandbox template with this CLI installed, when `sandbox.template` is unset. */
+  readonly defaultTemplate?: string;
+  /**
+   * Whether a result's cost covers the whole session, earlier rounds included, as
+   * Claude Code reports it, or only this invocation.
+   */
+  readonly costScope: 'session' | 'invocation';
   /** Shell command that installs a pinned version, run as root. */
   installCommand(version: string): string;
   versionCommand(): string;
@@ -89,6 +112,6 @@ export interface AgentAdapter {
   environment(placement: KeyPlacement): Record<string, string>;
   /** Checks to run in the sandbox before the agent starts. A failed check stops the run. */
   requirements(placement: KeyPlacement): SandboxRequirement[];
-  /** Turn one line of the agent's stdout into common events. */
-  parseLine(line: string): AgentEvent[];
+  /** A parser for one invocation's stdout. */
+  parser(): AgentParser;
 }

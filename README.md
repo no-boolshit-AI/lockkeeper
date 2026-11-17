@@ -125,6 +125,18 @@ On the pull request, anyone with write access can request changes in a review, o
 
 Runs wait in the queue, with the reason on the ticket, while 10 Lockkeeper pull requests are open in the repository or 40 runs started in the last 24 hours (`limits.open_prs_per_repo`, `limits.runs_per_day`).
 
+## Choosing the agent
+
+Claude Code is the default. Codex CLI and OpenCode are a config value away (`agent.use`), and each runs in E2B's template for it. All three get the same sealed sandbox, the same egress rules, the model key added outside the sandbox, instruction files only from the base branch, and no repository settings, hooks or MCP servers. They differ in the caps their CLIs enforce:
+
+| Agent | Turn and spending caps | Cost on the ticket |
+| --- | --- | --- |
+| Claude Code | Enforced by the CLI | Reported by the CLI |
+| OpenCode | Enforced by Lockkeeper, from the cost OpenCode reports after each step | Reported by OpenCode |
+| Codex CLI | None mid-run: Codex reports tokens only when it finishes, so the time limit bounds it | From token counts, when `agent.prices` is set |
+
+For Codex, put the OpenAI key in `CODEX_API_KEY`; for OpenCode, in the provider's variable, such as `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`. Then `lockkeeper secrets sync` stores it in E2B. The Codex and OpenCode adapters pass the same conformance tests as Claude Code, against fakes of each CLI, but have not yet run against the real CLIs in E2B.
+
 ## Commands
 
 | Command | What it does |

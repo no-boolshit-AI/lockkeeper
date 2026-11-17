@@ -47,8 +47,12 @@ projects:
     #   changes_requested: false
 
 agent:
+  # claude-code (default), codex or opencode. Each runs in its own E2B template.
   use: claude-code
   # model: claude-opus-5-5
+  # OpenCode takes provider/model, such as anthropic/claude-opus-5-5 or openai/gpt-6.1.
+  # Codex CLI reports tokens, not dollars: set prices per million tokens to get a cost.
+  # prices: { input: 1.25, cached_input: 0.125, output: 10 }
   # Pin the Claude Code version installed in the sandbox:
   # version: 2.1.325
   # egress: the model key is an E2B secret added outside the sandbox (run `lockkeeper secrets sync`).

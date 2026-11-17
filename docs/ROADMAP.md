@@ -118,7 +118,7 @@ Goal: anyone can install it alone and stay in GitHub for review.
 | Review feedback: a changes-requested review, or a `/agent` comment from a user with write access, resumes the same sandbox and session; a fresh sandbox continues from the branch when it cannot | F1 | Done. Two rounds per PR by default; the reply goes on the PR, and `/agent stop` there stops a follow-up |
 | Pause the sandbox when the PR opens; delete it on merge, close or 14 idle days | F2 | Done. Merges close out the ticket's status comment; a sweep deletes sandboxes no run holds |
 | Automatic CI fix rounds, two at most | P1 | Done. Only on Lockkeeper's own commit, and not for checks that also fail on the base branch |
-| Codex CLI and OpenCode adapters, plus adapter conformance tests | P1 | Not started |
+| Codex CLI and OpenCode adapters, plus adapter conformance tests | P1 | Built against Codex 0.169 and OpenCode 1.19, with conformance tests that run the whole loop against fakes of each CLI. Not yet run live in E2B. Lockkeeper enforces OpenCode's cost and turn caps from its step reports; Codex has no mid-run cap |
 | `demo` command with a sample repository | P1 | Done. Real sandbox and agent, a bundled sample repository and ticket, nothing written to GitHub or Jira |
 | Local run page with live log, diff and cost | P1 | Not started |
 | Docker image, npm releases, signed release artefacts | O2 | Built: a non-root image for amd64 and arm64, npm provenance, cosign signatures and GitHub attestations on tag. Not yet released |

@@ -3,6 +3,7 @@ import type {
   AgentAdapter,
   AgentEvent,
   AgentInvocation,
+  AgentParser,
   KeyPlacement,
   SandboxRequirement,
 } from './agent.js';
@@ -32,9 +33,16 @@ export class ClaudeCodeAdapter implements AgentAdapter {
     },
   };
   readonly extraDomains: readonly string[] = [];
+  readonly defaultTemplate = 'claude';
+  readonly costScope = 'session';
 
   installCommand(version: string): string {
     return `npm install --global --no-fund --no-audit ${shellQuote(`@anthropic-ai/claude-code@${version}`)}`;
+  }
+
+  /** Each stream-json line stands on its own, so the parser keeps no state. */
+  parser(): AgentParser {
+    return { parse: (line) => this.parseLine(line) };
   }
 
   versionCommand(): string {
@@ -159,6 +167,7 @@ export function summarizeToolInput(tool: string, input: unknown): string {
   const pick =
     str(fields.command) ??
     str(fields.file_path) ??
+    str(fields.filePath) ??
     str(fields.path) ??
     str(fields.pattern) ??
     str(fields.notebook_path) ??

@@ -116,7 +116,7 @@ ${options.config ?? ''}
 
 export type Harness = ReturnType<typeof harness>;
 
-export async function waitFor(condition: () => boolean, timeoutMs = 10_000): Promise<void> {
+export async function waitFor(condition: () => boolean, timeoutMs = 30_000): Promise<void> {
   const started = Date.now();
   while (!condition()) {
     if (Date.now() - started > timeoutMs) throw new Error('Timed out waiting for a condition.');

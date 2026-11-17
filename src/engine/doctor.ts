@@ -7,7 +7,7 @@ import type { Tracker, TrackerAbility } from '../tracker/tracker.js';
 import { detectCommands } from './detect.js';
 import { allowList } from './domains.js';
 import { resolveCommands } from './environment.js';
-import type { ModelKey } from './run.js';
+import { type ModelKey, templateFor } from './run.js';
 import {
   cloneRepo,
   inspectRoot,
@@ -227,7 +227,7 @@ async function sandboxChecks(
       metadata: { lockkeeper: 'doctor', repo: where },
       allowDomains,
       secrets,
-      ...(config.sandbox.template ? { template: config.sandbox.template } : {}),
+      ...templateFor(config, agent),
     });
   } catch (error) {
     add({ name: `Sandbox for ${where}`, status: 'fail', detail: errorMessage(error) });
@@ -249,7 +249,7 @@ async function sandboxChecks(
             name: agent.displayName,
             status: 'fail',
             detail: 'it is not installed in the sandbox template',
-            fix: 'Use E2B\'s "claude" template, or set agent.version to install a pinned version.',
+            fix: `Use E2B's "${agent.defaultTemplate ?? 'claude'}" template, or set agent.version to install a pinned version.`,
           },
     );
     for (const requirement of agent.requirements({ keyInEnvironment: key?.mode === 'env' })) {

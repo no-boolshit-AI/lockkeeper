@@ -1,4 +1,7 @@
+import type { AgentAdapter } from '../agent/agent.js';
 import { ClaudeCodeAdapter } from '../agent/claude-code.js';
+import { CodexAdapter } from '../agent/codex.js';
+import { OpenCodeAdapter } from '../agent/opencode.js';
 import { type LoadedConfig, loadConfig, loadEnvFile } from '../config/load.js';
 import { readSecrets, requireSecrets, type SecretsResult } from '../config/secrets.js';
 import { ConfigError } from '../core/errors.js';
@@ -26,10 +29,30 @@ export function openStore(context: CliContext): Store {
   return Store.open(context.loaded.config.store.path);
 }
 
-export function makeAgent(context: CliContext): ClaudeCodeAdapter {
-  const use = context.loaded.config.agent.use;
-  if (use !== 'claude-code') throw new ConfigError(`Unknown agent: ${use}`);
-  return new ClaudeCodeAdapter();
+export function makeAgent(context: CliContext): AgentAdapter {
+  const { agent } = context.loaded.config;
+  switch (agent.use) {
+    case 'claude-code':
+      return new ClaudeCodeAdapter();
+    case 'codex': {
+      const prices = agent.prices;
+      return new CodexAdapter(
+        prices
+          ? {
+              prices: {
+                input: prices.input,
+                output: prices.output,
+                ...(prices.cached_input !== undefined ? { cachedInput: prices.cached_input } : {}),
+              },
+            }
+          : {},
+      );
+    }
+    case 'opencode':
+      return new OpenCodeAdapter(agent.model ? { model: agent.model } : {});
+    default:
+      throw new ConfigError(`Unknown agent: ${agent.use as string}`);
+  }
 }
 
 export function makeE2B(context: CliContext): E2BProvider {
@@ -62,7 +85,7 @@ export function makeScm(context: CliContext): GitHubSourceControl {
 export async function resolveModelKey(
   context: CliContext,
   e2b: E2BProvider,
-  agent: ClaudeCodeAdapter,
+  agent: AgentAdapter,
 ): Promise<ModelKey> {
   const { config } = context.loaded;
   if (config.agent.key_injection === 'egress') {

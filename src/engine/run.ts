@@ -237,6 +237,12 @@ function normalizeKey(input: string): string {
   return key;
 }
 
+/** The sandbox template: the configured one, or the one with the agent's CLI installed. */
+export function templateFor(config: Config, agent: AgentAdapter): { template?: string } {
+  const template = config.sandbox.template ?? agent.defaultTemplate;
+  return template ? { template } : {};
+}
+
 function settingsFor(config: Config, key: string): ProjectSettings {
   const projectKey = key.slice(0, key.lastIndexOf('-'));
   const settings = projectSettings(config, projectKey);
@@ -664,7 +670,7 @@ class TicketRun {
       allowDomains,
       secrets,
       idempotencyKey: `lockkeeper-${this.run.id}-${attempt}`,
-      ...(config.sandbox.template ? { template: config.sandbox.template } : {}),
+      ...templateFor(config, agent),
     };
     const sandbox = await sandboxes.create(spec);
     this.sandbox = sandbox;
@@ -934,7 +940,8 @@ class TicketRun {
     this.audit('commands', commands ?? { setup: [], verify: this.verify, sources: {} });
     if (this.run.sessionId && parent) {
       this.resumeSession = true;
-      this.sessionBaseCostUsd = this.sessionCostOf(parent);
+      this.sessionBaseCostUsd =
+        this.deps.agent.costScope === 'session' ? this.sessionCostOf(parent) : 0;
       this.audit('session', {
         resumed: true,
         sessionId: this.run.sessionId,
@@ -1012,6 +1019,8 @@ class TicketRun {
       pollMs: this.deps.pollMs ?? 3_000,
       keepAliveEveryMs: 60_000,
       sandboxTimeoutMs: this.sandboxTimeout(),
+      budgetUsd: budget,
+      maxTurns: config.readiness.turns,
       now: this.now,
       ...(this.deps.sleep ? { sleep: this.deps.sleep } : {}),
       shouldStop: () => this.stopRequest(),
@@ -1020,7 +1029,7 @@ class TicketRun {
     if (watch.stopped === 'cancelled')
       throw new RunCancelledError(cancelReason(this.request.signal));
 
-    const costUsd = watch.result?.costUsd ?? 0;
+    const costUsd = watch.result?.costUsd ?? watch.usage?.costUsd ?? 0;
     this.priorCostUsd += costUsd;
     this.costUsd = (this.costUsd ?? 0) + costUsd;
     // No verdict (a cap, an error) must not block the ticket: go ahead as if ready.
@@ -1283,7 +1292,12 @@ class TicketRun {
         );
         let text: string;
         try {
-          text = await this.runAgent(round, { system, prompt, sessionId });
+          // A CLI that picks its own session ID reported it on the first round.
+          text = await this.runAgent(round, {
+            system,
+            prompt,
+            sessionId: this.run.sessionId ?? sessionId,
+          });
         } catch (error) {
           // A cap hit during a fix round keeps the work: it is published as a draft.
           if (round > 0 && error instanceof CapExceededError) {
@@ -1911,6 +1925,9 @@ class TicketRun {
     const files = agentFiles(layout, round);
     const started = await agentStarted(sandbox, files);
     const skipBytes = started ? (this.run.agentOffset ?? 0) : 0;
+    // What is left of the run's caps, for CLIs that report usage but enforce no caps.
+    const budgetLeft = config.limits.cost_usd - (this.costUsd ?? 0);
+    const turnsLeftNow = config.limits.turns - (this.turns ?? 0);
     if (started) {
       this.log.step(`Reattaching to ${agent.displayName}`);
       this.audit('agent_reattach', { round, offset: skipBytes });
@@ -1962,6 +1979,8 @@ class TicketRun {
       keepAliveEveryMs: 60_000,
       sandboxTimeoutMs: this.sandboxTimeout(),
       skipBytes,
+      budgetUsd: Math.max(0.01, budgetLeft),
+      maxTurns: Math.max(1, turnsLeftNow),
       onProgress: (offset) => {
         if (offset <= saved) return;
         saved = offset;
@@ -1973,11 +1992,19 @@ class TicketRun {
     });
     if (watch.stopped === 'detached') throw new RunDetachedError();
     const result = watch.result;
-    // Cost is the session total so far; turns are this round's only (see AgentEvent). A
-    // resumed session's total includes what earlier runs spent, which they already count.
-    if (result?.costUsd !== undefined)
-      this.costUsd = this.priorCostUsd + Math.max(0, result.costUsd - this.sessionBaseCostUsd);
-    if (result?.turns !== undefined) this.turns = (this.turns ?? 0) + result.turns;
+    const spent = result?.costUsd ?? watch.usage?.costUsd;
+    const turns = result?.turns ?? watch.usage?.turns;
+    if (spent !== undefined) {
+      if (agent.costScope === 'invocation') {
+        // This invocation's cost only: add it to what the run spent before it.
+        this.costUsd = (this.costUsd ?? 0) + spent;
+      } else {
+        // The session's total so far. A resumed session's total includes what earlier
+        // runs spent, which they already count.
+        this.costUsd = this.priorCostUsd + Math.max(0, spent - this.sessionBaseCostUsd);
+      }
+    }
+    if (turns !== undefined) this.turns = (this.turns ?? 0) + turns;
     this.audit('agent_exit', {
       round,
       stopped: watch.stopped,
@@ -1996,12 +2023,12 @@ class TicketRun {
         `The run reached its time limit of ${config.limits.minutes} minutes.`,
       );
     }
-    if (result?.cap === 'cost')
+    if (watch.stopped === 'budget' || result?.cap === 'cost')
       throw new CapExceededError(
         'cost',
         `The run reached its cost limit of $${config.limits.cost_usd}.`,
       );
-    if (result?.cap === 'turns')
+    if (watch.stopped === 'turns' || result?.cap === 'turns')
       throw new CapExceededError(
         'turns',
         `The agent reached its limit of ${config.limits.turns} turns.`,
@@ -2037,6 +2064,11 @@ class TicketRun {
     switch (event.type) {
       case 'session':
         this.log.info(`Agent session ${event.sessionId}${event.model ? ` (${event.model})` : ''}`);
+        // Some CLIs choose the session ID themselves. Fix rounds and follow-ups resume
+        // the implementation's session, never the readiness check's.
+        if (round >= 0 && event.sessionId !== this.run.sessionId) {
+          this.update({ sessionId: event.sessionId });
+        }
         break;
       case 'tool_call':
         this.log.debug(`${event.tool}: ${event.summary}`);

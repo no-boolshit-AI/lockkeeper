@@ -122,8 +122,21 @@ export const configSchema = z.object({
     .refine((projects) => Object.keys(projects).length > 0, 'needs at least one project'),
   agent: z
     .object({
-      use: z.enum(['claude-code']).default('claude-code'),
+      /** Claude Code by default; Codex CLI and OpenCode are the alternatives. */
+      use: z.enum(['claude-code', 'codex', 'opencode']).default('claude-code'),
+      /** For OpenCode, provider/model, such as anthropic/claude-opus-5-5. */
       model: z.string().min(1).optional(),
+      /**
+       * Codex CLI: prices per million tokens, to turn its token counts into a cost. Without
+       * them its runs report no cost and are bounded by the time limit only.
+       */
+      prices: z
+        .object({
+          input: z.number().nonnegative(),
+          cached_input: z.number().nonnegative().optional(),
+          output: z.number().nonnegative(),
+        })
+        .optional(),
       /** Pinned agent CLI version installed in the sandbox. Unset uses the template's. */
       version: z.string().min(1).optional(),
       /**

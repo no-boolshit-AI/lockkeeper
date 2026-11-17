@@ -165,7 +165,7 @@ export class LocalSandbox implements SandboxHandle {
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-/** A bin directory with the fake `claude` and a portable `setsid` (macOS has none). */
+/** A bin directory with fake agent CLIs and a portable `setsid` (macOS has none). */
 export function makeBinDir(root: string): string {
   const bin = join(root, 'bin');
   mkdirSync(bin, { recursive: true });
@@ -178,6 +178,9 @@ export function makeBinDir(root: string): string {
     `#!/bin/sh\nexec perl -e 'use POSIX qw(setsid); setsid(); exec @ARGV or die "exec: $!"' "$@"\n`,
   );
   script('claude', `#!/bin/sh\nexec node ${JSON.stringify(join(here, 'fake-claude.mjs'))} "$@"\n`);
+  for (const cli of ['codex', 'opencode']) {
+    script(cli, `#!/bin/sh\nexec node ${JSON.stringify(join(here, 'fake-cli.mjs'))} ${cli} "$@"\n`);
+  }
   return bin;
 }
 

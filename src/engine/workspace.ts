@@ -353,16 +353,24 @@ export interface WatchOptions {
   skipBytes?: number;
   /** Called with the bytes read so far, so a restarted process can carry on from there. */
   onProgress?: (offset: number) => void;
+  /**
+   * Caps for CLIs that report usage as they go but enforce none themselves. The agent
+   * is stopped when its reported usage reaches either.
+   */
+  budgetUsd?: number;
+  maxTurns?: number;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
   shouldStop?: () => StopRequest | Promise<StopRequest>;
 }
 
 export interface WatchResult {
-  stopped: 'exited' | 'deadline' | 'cancelled' | 'detached';
+  stopped: 'exited' | 'deadline' | 'cancelled' | 'detached' | 'budget' | 'turns';
   exitCode: number | null;
   result: ResultEvent | undefined;
   stderr: string;
+  /** The last usage the agent reported, for CLIs that report it as they go. */
+  usage?: { costUsd?: number; turns?: number };
 }
 
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -378,17 +386,27 @@ export async function watchAgent(
   let offset = 0;
   let lastKeepAlive = now();
   let result: ResultEvent | undefined;
+  let usage: WatchResult['usage'];
+  const parser = options.adapter.parser();
 
+  const take = (event: AgentEvent, fresh: boolean) => {
+    if (event.type === 'result') result = event;
+    if (event.type === 'usage') usage = { ...usage, ...event };
+    if (fresh) options.onEvent(event);
+  };
   const consume = (text: string, start: number) => {
     let position = start;
     for (const line of text.split('\n')) {
       const end = position + Buffer.byteLength(line, 'utf8') + 1;
-      for (const event of options.adapter.parseLine(line)) {
-        if (event.type === 'result') result = event;
-        if (end > skip) options.onEvent(event);
-      }
+      for (const event of parser.parse(line)) take(event, end > skip);
       position = end;
     }
+  };
+  const overCap = (): 'budget' | 'turns' | undefined => {
+    if (options.budgetUsd !== undefined && (usage?.costUsd ?? 0) >= options.budgetUsd)
+      return 'budget';
+    if (options.maxTurns !== undefined && (usage?.turns ?? 0) >= options.maxTurns) return 'turns';
+    return undefined;
   };
   const finish = async (
     stopped: WatchResult['stopped'],
@@ -397,7 +415,13 @@ export async function watchAgent(
     const stderr = await sandbox.exec(`tail -c 4000 ${q(files.stderr)} 2>/dev/null; true`, {
       timeoutMs: 30_000,
     });
-    return { stopped, exitCode, result, stderr: stderr.stdout };
+    return {
+      stopped,
+      exitCode,
+      result,
+      stderr: stderr.stdout,
+      ...(usage ? { usage } : {}),
+    };
   };
 
   for (;;) {
@@ -419,8 +443,15 @@ export async function watchAgent(
     if (exitText !== '') {
       consume(data.slice(lastNewline + 1), offset);
       await stopAgent(sandbox, files);
-      const code = Number.parseInt(exitText, 10);
-      return finish('exited', Number.isNaN(code) ? null : code);
+      const parsed = Number.parseInt(exitText, 10);
+      const code = Number.isNaN(parsed) ? null : parsed;
+      for (const event of parser.end?.(code) ?? []) take(event, true);
+      return finish('exited', code);
+    }
+    const cap = overCap();
+    if (cap) {
+      await stopAgent(sandbox, files);
+      return finish(cap, null);
     }
     if (now() >= options.deadline) {
       await stopAgent(sandbox, files);
