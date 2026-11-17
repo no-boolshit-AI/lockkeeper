@@ -148,7 +148,10 @@ export interface RunRequest {
 export interface DryRunPreview {
   branch: string;
   title: string;
+  /** The pull request body as GitHub Markdown, exactly as it would be posted. */
   body: string;
+  /** The same body as plain text, for reading in a terminal. */
+  bodyText: string;
   comments: string[];
   /** Label changes, links and transitions, one line each. */
   trackerChanges: string[];
@@ -1616,27 +1619,24 @@ class TicketRun {
     }
     const title = titleFor(key, ticket.summary);
     const durationMs = this.now() - this.startedAt;
-    const body = capPullRequestBody(
-      docToMarkdown(
-        pullRequestBodyDoc({
-          ctx,
-          summary: input.summary,
-          addedLines: policy.addedLines,
-          removedLines: policy.removedLines,
-          fileCount: input.reviewedFiles,
-          criteria: input.criteria,
-          checks: input.checks,
-          findings: policy.findings,
-          risks: input.risks,
-          draftReasons: input.draftReasons,
-          costUsd: this.costUsd,
-          durationMs,
-          fixRounds: this.fixRounds,
-          ...(input.proof ? { proof: input.proof } : {}),
-          ...this.pullRequestTotal(),
-        }),
-      ),
-    );
+    const bodyDoc = pullRequestBodyDoc({
+      ctx,
+      summary: input.summary,
+      addedLines: policy.addedLines,
+      removedLines: policy.removedLines,
+      fileCount: input.reviewedFiles,
+      criteria: input.criteria,
+      checks: input.checks,
+      findings: policy.findings,
+      risks: input.risks,
+      draftReasons: input.draftReasons,
+      costUsd: this.costUsd,
+      durationMs,
+      fixRounds: this.fixRounds,
+      ...(input.proof ? { proof: input.proof } : {}),
+      ...this.pullRequestTotal(),
+    });
+    const body = capPullRequestBody(docToMarkdown(bodyDoc));
     const draft = input.draftReasons.length > 0;
     const wantedBranch = branchName(input.workflow, key, ticket.summary);
 
@@ -1807,6 +1807,7 @@ class TicketRun {
           branch: branchShown,
           title,
           body,
+          bodyText: docToPlainText(bodyDoc),
           comments: recorder.comments().map((comment) => docToPlainText(comment.body)),
           trackerChanges: recorder.changes(),
           files: collected.files.map((file) => ({

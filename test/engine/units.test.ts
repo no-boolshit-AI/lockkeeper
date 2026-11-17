@@ -21,6 +21,7 @@ import {
 } from '../../src/engine/git-diff.js';
 import {
   buildSystemPrompt,
+  buildTaskPrompt,
   matchCriteria,
   parseAgentReport,
   parseReadiness,
@@ -151,6 +152,16 @@ describe('prompts and the agent report', () => {
     expect(prompt).toContain('`npm test`');
     expect(prompt).toContain('<lockkeeper-report>');
     expect(prompt).not.toContain('bug fix');
+  });
+
+  it('says what to do with the ticket, without naming a workflow', () => {
+    const ticket = ticketFixture();
+    const feature = buildTaskPrompt(ticket, 'feature');
+    expect(feature.split('\n')[0]).toBe(`Implement Jira ticket ${ticket.key}.`);
+    expect(feature).not.toContain('workflow');
+    const bugfix = buildTaskPrompt(ticket, 'bugfix');
+    expect(bugfix.split('\n')[0]).toContain('failing test first');
+    expect(bugfix).not.toContain('workflow');
   });
 });
 

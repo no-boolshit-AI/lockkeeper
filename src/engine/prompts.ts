@@ -144,7 +144,10 @@ export function buildTaskPrompt(
   options: TaskOptions = {},
 ): string {
   const parts = [
-    `Implement Jira ticket ${ticket.key} using the ${workflow} workflow.`,
+    // Name what to do, not the workflow: "the feature workflow" means nothing to an agent.
+    workflow === 'bugfix'
+      ? `Fix the bug that Jira ticket ${ticket.key} describes, with a failing test first as your instructions say.`
+      : `Implement Jira ticket ${ticket.key}.`,
     `<ticket>\n${renderTicket(ticket)}</ticket>`,
   ];
   if (options.earlierAttempt) {

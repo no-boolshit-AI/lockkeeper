@@ -148,9 +148,9 @@ function printDemo(result: RunResult, durationMs: number): void {
       : 'Ready for review.',
   );
   out();
-  out(preview.body.trimEnd());
+  out(terminalSafe(preview.bodyText).trimEnd());
   rule('What it would post on the Jira ticket');
-  for (const comment of preview.comments) out(`${comment.trimEnd()}\n`);
+  for (const comment of preview.comments) out(`${terminalSafe(comment).trimEnd()}\n`);
   const seconds = Math.round(durationMs / 1000);
   out(
     `Done in ${Math.floor(seconds / 60)} min ${seconds % 60} s for ${formatCost(result.run.costUsd ?? undefined)} of model use.`,
@@ -313,9 +313,9 @@ function printResult(result: RunResult): void {
       }
       for (const reason of preview.draftReasons) out(`Draft because: ${reason}`);
       out('\n--- Pull request body ---\n');
-      out(preview.body);
+      out(terminalSafe(preview.bodyText));
       out('--- Jira comments ---\n');
-      for (const comment of preview.comments) out(`${comment}\n`);
+      for (const comment of preview.comments) out(`${terminalSafe(comment)}\n`);
       if (preview.trackerChanges.length > 0) {
         out('--- Other Jira changes ---\n');
         for (const change of preview.trackerChanges) out(`  ${change}`);

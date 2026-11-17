@@ -165,6 +165,9 @@ describe('lockkeeper demo', () => {
     expect(preview.diff).toContain('+export function cartSummary');
     expect(preview.diff).toContain('+++ b/test/summary.test.js');
     expect(preview.body).toContain('npm test');
+    // The terminal gets plain text, without Markdown escapes.
+    expect(preview.bodyText).toContain('What changed');
+    expect(preview.bodyText).not.toMatch(/\\[.()\-]/);
     expect(preview.comments.join('\n')).toContain('DEMO-1 · ready for review');
     // The checks ran on the sample's main first, where they pass.
     expect(result.run.state).toBe('done');
