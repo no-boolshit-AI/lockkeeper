@@ -8,6 +8,13 @@ Report privately through GitHub: [Report a vulnerability](https://github.com/no-
 
 Please include what you found, how to reproduce it, and what an attacker could do with it. We aim to acknowledge reports within three working days and to agree on a disclosure date with you.
 
+## How Lockkeeper is secured
+
+- [Threat model](docs/security/threat-model.md): what we protect, from whom, how, and what remains.
+- [Where your data goes](docs/security/data-flow.md): every party that sees code, tickets or keys.
+- [Permissions](docs/security/permissions.md): each GitHub, Jira and E2B permission, with the reason for it.
+- [Releasing](docs/RELEASING.md): how releases are signed, and how to verify them.
+
 ## What counts
 
 The most important class of bug breaks the security model in the README. For example:

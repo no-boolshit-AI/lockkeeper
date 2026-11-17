@@ -38,6 +38,8 @@ The design assumes prompt injection will sometimes succeed. It makes sure a hija
 - **One checkpoint before GitHub.** The control plane checks the diff and the text the agent wrote, then creates the commit itself. Lockkeeper never force-pushes, never writes to a branch it did not create, and has no code path that merges or approves.
 - **Untrusted text stays data.** Only allow-listed internal users start, stop or retry runs, checked against the ticket's history. Tickets with text from external accounts are refused by default. Everything posted is templated, length-capped and scanned for secrets, and agent text is escaped so it cannot add links, images or @-mentions.
 
+The [threat model](docs/security/threat-model.md), the [data-flow page](docs/security/data-flow.md) and the [permission list](docs/security/permissions.md) go into detail. [Troubleshooting](docs/troubleshooting.md) is keyed to `lockkeeper doctor`'s output.
+
 Honest limits: hosted E2B and the model provider see the code and the ticket. Allowed hosts and DNS remain possible exfiltration channels. On E2B, allowing any domain also opens its DNS resolver. Agent-written code runs in your CI with your repository's secrets, so keep sensitive jobs behind protected environments. Events from inside the sandbox are telemetry, not proof: a hijacked agent could hide a host from the commands Lockkeeper reads. Budgets are enforced by the agent CLI and the wall clock by the control plane, and your CI stays the authority on tests.
 
 ## Try it first

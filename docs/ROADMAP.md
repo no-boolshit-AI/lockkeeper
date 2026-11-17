@@ -122,11 +122,20 @@ Goal: anyone can install it alone and stay in GitHub for review.
 | `demo` command with a sample repository | P1 | Done. Real sandbox and agent, a bundled sample repository and ticket, nothing written to GitHub or Jira |
 | Local run page with live log, diff and cost | P1 | Done: `lockkeeper ui` or `start --ui`. Read-only, 127.0.0.1 only, under a secret path, and it answers only its own host name |
 | Docker image, npm releases, signed release artefacts | O2 | Built: a non-root image for amd64 and arm64, npm provenance, cosign signatures and GitHub attestations on tag. Not yet released |
-| Security docs: threat model, data-flow page naming every party, permission list with a reason for each, troubleshooting keyed to `doctor` output | 1.0 assets | Not started |
+| Security docs: threat model, data-flow page naming every party, permission list with a reason for each, troubleshooting keyed to `doctor` output | 1.0 assets | Done: [threat model](security/threat-model.md), [data flow](security/data-flow.md), [permissions](security/permissions.md), [troubleshooting](troubleshooting.md) |
 | Baseline test run on the base branch | P1 | Done. Checks that also fail on the base branch are marked for the agent, in the PR and on the ticket. They still get fix rounds and keep a draft, since one failing command can hide new failures |
 | Cap on open agent PRs per repository, daily run cap | P1 | Done. Runs over a cap wait in the queue and say why on the ticket |
 
 Exit gate: five fresh installs each reach a first PR in under 15 minutes.
+
+Build status on 17 November 2026: every M3 workstream is built and tested (200 tests). Not yet done:
+
+- Live runs of review follow-ups, CI fix rounds, the clean-up and `lockkeeper demo` against real E2B, GitHub and Jira. Tests cover them with real git, a local sandbox and fake agent CLIs.
+- Live runs of the Codex CLI and OpenCode adapters, including whether E2B's egress key injection works with each.
+- The first tagged release, which needs the npm and GitHub `release` environment set up as [RELEASING.md](RELEASING.md) describes.
+- The exit gate itself: five timed fresh installs.
+
+Carried over from M2: the readiness check and the implementation still use separate agent sessions, and a run stopped mid-agent reports no cost.
 
 ## M4 1.0 (weeks 11-14)
 
