@@ -97,19 +97,20 @@ export interface Outcome {
 
 function checksLine(checks: readonly CheckResult[]): Inline[] {
   if (checks.length === 0) return [text('No lint or test commands are configured or detected.')];
-  const failed = checks.filter((check) => !check.passed);
+  const failed = checks.filter((check) => !check.passed && !check.failedOnBase);
+  const before = checks.filter((check) => !check.passed && check.failedOnBase);
   const inlines: Inline[] = [text('Verified by: ')];
   checks.forEach((check, index) => {
     if (index > 0) inlines.push(text(', '));
     inlines.push(code(check.command));
   });
-  inlines.push(
-    text(
-      failed.length === 0
-        ? ' (all passed)'
-        : ` (failed: ${failed.map((check) => check.command).join(', ')})`,
-    ),
-  );
+  const notes: string[] = [];
+  if (failed.length > 0) notes.push(`failed: ${failed.map((check) => check.command).join(', ')}`);
+  if (before.length > 0)
+    notes.push(
+      `already failing on the base branch: ${before.map((check) => check.command).join(', ')}`,
+    );
+  inlines.push(text(notes.length === 0 ? ' (all passed)' : ` (${notes.join('; ')})`));
   return inlines;
 }
 
@@ -474,7 +475,9 @@ export function pullRequestBodyDoc(input: PullRequestBodyInput): Doc {
           text(
             check.passed
               ? `: passed (${Math.round(check.durationMs / 1000)} s)`
-              : `: failed with exit code ${check.exitCode}`,
+              : check.failedOnBase
+                ? `: failed with exit code ${check.exitCode}, as it does on the base branch without this change`
+                : `: failed with exit code ${check.exitCode}`,
           ),
         ]),
       ),

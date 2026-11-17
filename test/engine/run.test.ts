@@ -288,11 +288,53 @@ describe('runTicket', () => {
 
     expect(result.outcome).toBe('pr');
     if (result.outcome !== 'pr') return;
-    expect(result.draftReasons).toContain('Checks failed: grep -q hello hello.txt.');
+    // The check fails on the base branch too, where hello.txt does not exist yet.
+    expect(result.draftReasons).toContain(
+      'Checks failed: grep -q hello hello.txt (it fails on the base branch too).',
+    );
     const pr = h.scm.pullRequests[0];
     expect(pr?.draft).toBe(true);
     expect(pr?.body).toContain('## Why this is a draft');
     expect(h.comments()[0]).toContain('draft pull request, needs a person');
+  });
+
+  it('runs the checks on the base branch first and tells old failures from new ones', async () => {
+    h = harness({
+      config: `
+repo:
+  setup: []
+  verify: ['test -f README.md', 'test ! -f broken.txt', 'test -f hello.txt']
+limits:
+  fix_rounds: 1
+`,
+      files: { 'README.md': '# Demo\n' },
+      rounds: [
+        { writes: { 'hello.txt': 'hello\n', 'broken.txt': 'oops\n' }, text: report() },
+        { writes: { 'hello.txt': 'hello\n' }, text: report() },
+      ],
+    });
+    const result = await runTicket(h.deps, { ticketKey: 'DEMO-1', triggeredBy: 'test' });
+    expect(result.outcome).toBe('pr');
+    const run = h.store.listRuns()[0] as RunRecord;
+    // On main, only the check for the missing feature fails.
+    expect(h.store.latestEvent(run.id, 'baseline')).toMatchObject({
+      failed: ['test -f hello.txt'],
+    });
+    // The first round broke a check that passed on main: that gets a fix round, and the
+    // agent is not told it was failing before.
+    const fix = h.call(1).prompt;
+    expect(fix).toContain('test ! -f broken.txt');
+    expect(fix).not.toContain('also failed on the base branch');
+  });
+
+  it('skips the baseline when turned off', async () => {
+    h = harness({
+      config: "repo:\n  setup: []\n  verify: ['test -f hello.txt']\n  baseline: false\n",
+      rounds: [{ writes: { 'hello.txt': 'hello\n' }, text: report() }],
+    });
+    await runTicket(h.deps, { ticketKey: 'DEMO-1', triggeredBy: 'test' });
+    const run = h.store.listRuns()[0] as RunRecord;
+    expect(h.store.latestEvent(run.id, 'baseline')).toBeUndefined();
   });
 
   it('keeps the pull request in draft when a protected path changes', async () => {

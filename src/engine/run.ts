@@ -97,10 +97,12 @@ import {
   type Layout,
   layoutFor,
   mergeBase,
+  newFailures,
   readInstructionFiles,
   resetCheckout,
   runCommands,
   type StopRequest,
+  stagedDiff,
   startAgent,
   tail,
   updateCheckout,
@@ -152,6 +154,8 @@ export interface DryRunPreview {
   trackerChanges: string[];
   files: { path: string; status: string; added: number | null; removed: number | null }[];
   draftReasons: string[];
+  /** The change as a unified diff, read back from the sandbox: untrusted, capped. */
+  diff: string;
 }
 
 export type RunResult =
@@ -769,6 +773,7 @@ class TicketRun {
         );
       }
     }
+    await this.runBaseline();
     if (config.sandbox.close_github_after_setup && sandbox.setEgress) {
       // From here on, the agent can reach only the model API and package registries.
       const narrowed = allowDomains.filter((domain) => !GITHUB_DOMAINS.includes(domain));
@@ -777,6 +782,46 @@ class TicketRun {
       this.log.info('GitHub is closed to the sandbox for the rest of the run.');
     }
     this.checkCancelled();
+  }
+
+  /**
+   * P1: run the checks on the base branch before the agent changes anything, so the
+   * agent, the PR and the ticket can tell failures that were already there from new
+   * ones. A check that fails either way still gets fix rounds and keeps the PR a draft:
+   * one failing command can hide new failures behind old ones. Retries and follow-ups
+   * start from a PR branch, whose failures are the agent's own, so they skip this.
+   */
+  private async runBaseline(): Promise<void> {
+    const { config } = this.deps;
+    if (!this.settings.baseline || this.continuing || this.verify.length === 0) return;
+    const sandbox = this.sandbox as SandboxHandle;
+    const layout = this.layout as Layout;
+    this.log.step(`Running the checks on ${this.settings.baseBranch} first`);
+    await this.progress(
+      this.context(),
+      `Lockkeeper is running the checks on ${this.settings.baseBranch} before any change`,
+    );
+    const timeout = this.stepTimeout(config.limits.verify_minutes * 60_000);
+    await this.extendSandbox(Math.min(MAX_SANDBOX_MS, timeout + 5 * 60_000));
+    const checks = await runCommands(sandbox, layout, this.verify, {
+      timeoutMs: timeout,
+      stopOnFailure: false,
+      now: this.now,
+    });
+    const failed = checks.filter((check) => !check.passed).map((check) => check.command);
+    this.audit('baseline', { checks, failed });
+    if (failed.length > 0) {
+      this.log.warn(
+        `Already failing on ${this.settings.baseBranch}, so not blamed on the agent: ${failed.join(', ')}`,
+      );
+    }
+    this.checkCancelled();
+  }
+
+  /** Checks that failed on the base branch before the agent started. */
+  private baselineFailures(): Set<string> {
+    const saved = this.deps.store.latestEvent<{ failed?: string[] }>(this.run.id, 'baseline');
+    return new Set(saved?.failed ?? []);
   }
 
   /** The model key as an egress secret, when the proxy adds it (E3). */
@@ -1266,9 +1311,17 @@ class TicketRun {
         stopOnFailure: false,
         now: this.now,
       });
+      const onBase = this.baselineFailures();
+      for (const check of checks) {
+        if (!check.passed && onBase.has(check.command)) check.failedOnBase = true;
+      }
       this.audit('checks', { round, checks });
       const failures = checks.filter((check) => !check.passed);
-      for (const check of checks) this.log.info(`${check.passed ? '✓' : '✗'} ${check.command}`);
+      for (const check of checks) {
+        this.log.info(
+          `${check.passed ? '✓' : '✗'} ${check.command}${check.failedOnBase ? ' (fails on the base branch too)' : ''}`,
+        );
+      }
       if (failures.length === 0) break;
       if (round >= config.limits.fix_rounds) break;
       const budgetLeft = config.limits.cost_usd - (this.costUsd ?? 0);
@@ -1286,6 +1339,7 @@ class TicketRun {
             command: failure.command,
             exitCode: failure.exitCode,
             output: failure.output,
+            ...(failure.failedOnBase ? { failedOnBase: true } : {}),
           })),
         ),
       };
@@ -1294,7 +1348,7 @@ class TicketRun {
       this.update({ fixRounds: this.fixRounds });
     }
     let proof: FailingTestProof | undefined;
-    if (workflow === 'bugfix' && checks.every((check) => check.passed)) {
+    if (workflow === 'bugfix' && newFailures(checks).length === 0) {
       proof = await this.proveFailingTest(ctx, report);
     }
     const outsideHosts = this.outsideHosts();
@@ -1333,8 +1387,15 @@ class TicketRun {
     const base = this.base as BaseRef;
     const commands = testCommands(this.verify);
     const tests = (await changedPaths(sandbox, layout, base.sha)).filter(isTestPath);
+    const brokenOnBase = commands.filter((command) => this.baselineFailures().has(command));
     let proof: FailingTestProof;
-    if (tests.length === 0) {
+    if (brokenOnBase.length > 0) {
+      // A test command that already fails on the base branch cannot show a new failure.
+      proof = {
+        kind: 'skipped',
+        reason: `${brokenOnBase.join(', ')} already fails on the base branch.`,
+      };
+    } else if (tests.length === 0) {
       proof = {
         kind: 'no_test',
         reason: cleanAgentText(report?.no_failing_test_reason ?? '', 300),
@@ -1488,8 +1549,12 @@ class TicketRun {
   ): string[] {
     const reasons: string[] = [];
     const failed = checks.filter((check) => !check.passed);
-    if (failed.length > 0)
-      reasons.push(`Checks failed: ${failed.map((check) => check.command).join(', ')}.`);
+    if (failed.length > 0) {
+      const named = failed.map((check) =>
+        check.failedOnBase ? `${check.command} (it fails on the base branch too)` : check.command,
+      );
+      reasons.push(`Checks failed: ${named.join(', ')}.`);
+    }
     if (verify.length === 0)
       reasons.push('No lint or test commands ran, so nothing verified the change.');
     for (const finding of policy.findings.filter((entry) => entry.severity === 'draft'))
@@ -1701,6 +1766,10 @@ class TicketRun {
     }
 
     if (dryRun) {
+      const diff =
+        this.sandbox && this.layout
+          ? redactSecrets(await stagedDiff(this.sandbox, this.layout, input.base.sha)).text
+          : '';
       await this.sandbox?.destroy();
       this.sandbox = undefined;
       this.update({
@@ -1726,6 +1795,7 @@ class TicketRun {
             removed: file.removed,
           })),
           draftReasons: input.draftReasons,
+          diff,
         },
       };
     }

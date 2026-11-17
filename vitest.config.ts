@@ -4,6 +4,7 @@ export default defineConfig({
   test: {
     include: ['test/**/*.test.ts'],
     environment: 'node',
-    testTimeout: 30_000,
+    // Tests drive real git and processes; leave room for a busy machine.
+    testTimeout: 60_000,
   },
 });

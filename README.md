@@ -22,7 +22,7 @@ Jira ticket ──snapshot──▶ control plane ──creates──▶ E2B san
 2. **Sandbox.** A fresh E2B microVM with outbound traffic denied except to the model API, GitHub and package registries.
 3. **Readiness check.** A short read-only pass decides whether the ticket can be built as written, and asks on the ticket if not.
 4. **Implement.** Claude Code runs headless in `--bare` mode, so repository hooks, settings and MCP servers are never loaded. It gets turn and budget caps. Setup and test commands come from `lockkeeper.yml`, then the dev container, then `AGENTS.md`, then detection.
-5. **Verify.** Lockkeeper, not the agent, runs your lint and test commands. Failures go back to the agent for up to two fix rounds. For a bug, Lockkeeper also runs the agent's new tests without the fix and expects them to fail.
+5. **Verify.** Lockkeeper, not the agent, runs your lint and test commands, first on the base branch and again after the agent. Failures go back to the agent for up to two fix rounds, marked when they also fail on the base branch. For a bug, Lockkeeper also runs the agent's new tests without the fix and expects them to fail.
 6. **Publish.** The control plane reads the diff and checks it: protected paths, size, submodules, secrets. Then it creates a verified commit and the PR through the GitHub API. The PR is a draft, with the reason stated, unless every check passed and every acceptance criterion has evidence.
 7. **Report.** One status comment on the ticket, edited in place, plus a short final comment that notifies the requester, the PR as a remote link, and labels.
 8. **Review.** The sandbox is paused while the PR is in review. A changes-requested review, or a PR comment starting with `/agent`, resumes it with the same agent session, adds a commit and replies on the PR. Failed CI on Lockkeeper's commit gets up to two fix rounds on its own.
@@ -40,11 +40,21 @@ The design assumes prompt injection will sometimes succeed. It makes sure a hija
 
 Honest limits: hosted E2B and the model provider see the code and the ticket. Allowed hosts and DNS remain possible exfiltration channels. On E2B, allowing any domain also opens its DNS resolver. Agent-written code runs in your CI with your repository's secrets, so keep sensitive jobs behind protected environments. Events from inside the sandbox are telemetry, not proof: a hijacked agent could hide a host from the commands Lockkeeper reads. Budgets are enforced by the agent CLI and the wall clock by the control plane, and your CI stays the authority on tests.
 
+## Try it first
+
+The demo runs a sample ticket against a small sample repository that ships with Lockkeeper, in a real E2B sandbox with the real agent. It needs only an E2B key and an Anthropic key, takes a few minutes, and writes nothing to GitHub or Jira. It prints the diff, the pull request it would open and the comments it would post.
+
+```bash
+E2B_API_KEY=e2b_... ANTHROPIC_API_KEY=sk-ant-... lockkeeper demo
+```
+
+The first run stores the Anthropic key as an E2B secret, so E2B adds it to the agent's requests and the sandbox never sees it.
+
 ## Quickstart
 
 You need Node 22.19 or later and four accounts: Jira Cloud, GitHub, [E2B](https://e2b.dev) (the free Hobby plan works) and an Anthropic API key.
 
-**1. Install from source.** The npm package will follow.
+**1. Install from source.** The npm package and the container image follow with the first release.
 
 ```bash
 git clone https://github.com/no-boolshit-AI/lockkeeper.git
@@ -99,6 +109,12 @@ Then `lockkeeper runs` lists runs, and `lockkeeper runs <id>` shows a run's audi
 lockkeeper start
 ```
 
+Or run it as a container, with the folder holding `lockkeeper.yml` and `.lockkeeper/` mounted at `/data`. The SQLite file lives there too, so runs survive a restart.
+
+```bash
+docker run -d --name lockkeeper --restart unless-stopped -v "$PWD:/data" ghcr.io/no-boolshit-ai/lockkeeper:latest
+```
+
 Now adding the `agent` label to a ticket starts a run within a minute. Lockkeeper checks the ticket's history to see who added the label. Only people on `jira.allow_users` count, by email, account ID or group. With an empty list, anyone in your Jira organisation does. Apps and customer accounts never do.
 
 Before writing code, a short read-only pass checks that the ticket can be built as written. If something essential is missing, Lockkeeper asks up to five numbered questions in a comment that mentions whoever added the label, and waits. A reply starting `/agent go`, with the answers, continues the run. Tickets that are not a code change are declined with a reason. The check has its own small cost cap (`readiness` in `lockkeeper.yml`), and anything it changes is thrown away.
@@ -113,6 +129,7 @@ Runs wait in the queue, with the reason on the ticket, while 10 Lockkeeper pull 
 
 | Command | What it does |
 | --- | --- |
+| `lockkeeper demo` | Run a sample ticket against a sample repository in a real sandbox, writing nothing to GitHub or Jira |
 | `lockkeeper start` | Watch Jira and run labelled tickets until stopped |
 | `lockkeeper run <ticket> [--dry-run]` | Run one ticket end to end, or continue its run if the process running it stopped |
 | `lockkeeper init` | Set up step by step: Jira, a GitHub App, E2B and the model key |

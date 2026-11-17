@@ -1,0 +1,14 @@
+# Only package.json, the lockfile, tsconfig files, src and the docs copied into the
+# image are needed. Never send credentials or local state to the build.
+.git
+.github
+.lockkeeper
+lockkeeper.yml
+node_modules
+dist
+test
+coverage
+*.db
+*.db-*
+*.pem
+.env

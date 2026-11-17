@@ -56,6 +56,8 @@ const repoSettings = z.object({
   setup: commandList.optional(),
   verify: commandList.optional(),
   protected_paths: z.array(z.string().min(1)).optional(),
+  /** Run the checks on the base branch first, so failures already there are not blamed on the agent. */
+  baseline: z.boolean().optional(),
 });
 
 const reviewOverrides = z.object({
@@ -75,6 +77,7 @@ const projectSchema = z.object({
   setup: commandList.optional(),
   verify: commandList.optional(),
   protected_paths: z.array(z.string().min(1)).optional(),
+  baseline: z.boolean().optional(),
   /** F1: this project's own review settings. */
   review: reviewOverrides.optional(),
 });
@@ -214,6 +217,8 @@ export interface ProjectSettings {
   protectedPaths: string[];
   allowExternal: boolean;
   review: { rounds: number; changesRequested: boolean };
+  /** Run the checks on the base branch before the agent starts. */
+  baseline: boolean;
 }
 
 export function projectSettings(
@@ -232,6 +237,7 @@ export function projectSettings(
     protectedPaths: project.protected_paths ??
       config.repo.protected_paths ?? [...DEFAULT_PROTECTED_PATHS],
     allowExternal: project.allow_external ?? config.jira.allow_external,
+    baseline: project.baseline ?? config.repo.baseline ?? true,
     review: {
       rounds: project.review?.rounds ?? config.review.rounds,
       changesRequested: project.review?.changes_requested ?? config.review.changes_requested,

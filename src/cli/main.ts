@@ -3,13 +3,18 @@ import './warnings.js';
 import { readFileSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { Command } from 'commander';
+import { ClaudeCodeAdapter } from '../agent/claude-code.js';
+import { loadEnvFile } from '../config/load.js';
 import { projectSettings } from '../config/schema.js';
 import { ENV } from '../config/secrets.js';
-import { LockkeeperError } from '../core/errors.js';
-import { consoleLogger } from '../core/log.js';
+import { ConfigError, LockkeeperError } from '../core/errors.js';
+import { consoleLogger, type Logger } from '../core/log.js';
 import { Daemon } from '../daemon/daemon.js';
+import { demoConfig, runDemo } from '../demo/demo.js';
+import { demoTicket } from '../demo/sample.js';
 import { type DoctorCheck, type DoctorDeps, runDoctor } from '../engine/doctor.js';
-import { type RunResult, runTicket } from '../engine/run.js';
+import { formatCost } from '../engine/report.js';
+import { type ModelKey, type RunResult, runTicket } from '../engine/run.js';
 import { E2BProvider } from '../sandbox/e2b/e2b-provider.js';
 import { GitHubSourceControl } from '../scm/github/github-scm.js';
 import { JiraClient } from '../tracker/jira/client.js';
@@ -41,6 +46,115 @@ const program = new Command()
 
 function out(line = ''): void {
   process.stdout.write(`${line}\n`);
+}
+
+/**
+ * Text that came out of a sandbox, made safe for a terminal: no escape sequences or
+ * other control characters that could rewrite what is on screen.
+ */
+function terminalSafe(text: string): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: removing control characters on purpose
+  return text.replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g, '');
+}
+
+/** The demo's model key: an E2B secret, stored from ANTHROPIC_API_KEY if it is not there. */
+async function demoModelKey(
+  e2b: E2BProvider,
+  envName: string,
+  secretName: string,
+  log: Logger,
+): Promise<ModelKey> {
+  if (await e2b.hasSecret(secretName)) return { mode: 'egress', secretName };
+  const value = process.env[envName]?.trim();
+  if (!value) {
+    throw new ConfigError(
+      `Set ${envName} to your model API key.`,
+      `The demo stores it as the E2B secret "${secretName}", so E2B adds it to the agent's requests outside the sandbox and the sandbox never sees it.`,
+    );
+  }
+  await e2b.putSecret(secretName, value);
+  log.step(
+    `Stored your model key as the E2B secret "${secretName}". E2B adds it to the agent's requests outside the sandbox, so the sandbox never sees it.`,
+  );
+  return { mode: 'egress', secretName };
+}
+
+program
+  .command('demo')
+  .description(
+    'Try Lockkeeper on a sample ticket and repository in a real sandbox. Nothing is written to GitHub or Jira',
+  )
+  .action(async () => {
+    const globals = program.opts<{ verbose?: boolean }>();
+    const log = consoleLogger({ verbose: Boolean(globals.verbose) });
+    loadEnvFile(process.cwd());
+    const agent = new ClaudeCodeAdapter();
+    const e2bKey = process.env[ENV.e2bApiKey]?.trim();
+    if (!e2bKey) {
+      throw new ConfigError(
+        `Set ${ENV.e2bApiKey} to an E2B API key.`,
+        `Create one at https://e2b.dev/dashboard. The demo also needs ${agent.credential.env}.`,
+      );
+    }
+    const config = demoConfig();
+    const e2b = new E2BProvider({ apiKey: e2bKey });
+    const modelKey = await demoModelKey(e2b, agent.credential.env, config.agent.secret_name, log);
+    const ticket = demoTicket();
+    out(`Lockkeeper demo: ${ticket.key} "${ticket.summary}", on a small sample shop library.`);
+    out('The sandbox and the agent are real. Nothing is written to GitHub or Jira.\n');
+    const controller = new AbortController();
+    let interrupts = 0;
+    const onSignal = () => {
+      interrupts += 1;
+      if (interrupts > 1) process.exit(130);
+      log.warn('Stopping the demo (press Ctrl-C again to quit at once)…');
+      controller.abort('The demo was stopped.');
+    };
+    process.on('SIGINT', onSignal);
+    const started = Date.now();
+    try {
+      const result = await runDemo({
+        sandboxes: e2b,
+        agent,
+        modelKey,
+        config,
+        log,
+        signal: controller.signal,
+      });
+      printDemo(result, Date.now() - started);
+      if (result.outcome !== 'dry_run') process.exitCode = 1;
+    } finally {
+      process.off('SIGINT', onSignal);
+    }
+  });
+
+function printDemo(result: RunResult, durationMs: number): void {
+  out();
+  if (result.outcome !== 'dry_run') {
+    printResult(result);
+    return;
+  }
+  const { preview } = result;
+  const rule = (title: string) =>
+    out(`\n── ${title} ${'─'.repeat(Math.max(4, 60 - title.length))}\n`);
+  rule('The change');
+  out(terminalSafe(preview.diff).trimEnd() || '(no diff)');
+  rule('The pull request it would open');
+  out(`Title: ${preview.title}`);
+  out(
+    preview.draftReasons.length > 0
+      ? `As a draft, because: ${preview.draftReasons.join(' ')}`
+      : 'Ready for review.',
+  );
+  out();
+  out(preview.body.trimEnd());
+  rule('What it would post on the Jira ticket');
+  for (const comment of preview.comments) out(`${comment.trimEnd()}\n`);
+  const seconds = Math.round(durationMs / 1000);
+  out(
+    `Done in ${Math.floor(seconds / 60)} min ${seconds % 60} s for ${formatCost(result.run.costUsd ?? undefined)} of model use.`,
+  );
+  out('Next: `lockkeeper init` connects your Jira and GitHub. Then label a ticket.');
 }
 
 program

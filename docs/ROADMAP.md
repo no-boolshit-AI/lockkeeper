@@ -119,11 +119,11 @@ Goal: anyone can install it alone and stay in GitHub for review.
 | Pause the sandbox when the PR opens; delete it on merge, close or 14 idle days | F2 | Done. Merges close out the ticket's status comment; a sweep deletes sandboxes no run holds |
 | Automatic CI fix rounds, two at most | P1 | Done. Only on Lockkeeper's own commit, and not for checks that also fail on the base branch |
 | Codex CLI and OpenCode adapters, plus adapter conformance tests | P1 | Not started |
-| `demo` command with a sample repository | P1 | Not started |
+| `demo` command with a sample repository | P1 | Done. Real sandbox and agent, a bundled sample repository and ticket, nothing written to GitHub or Jira |
 | Local run page with live log, diff and cost | P1 | Not started |
-| Docker image, npm releases, signed release artefacts | O2 | Not started |
+| Docker image, npm releases, signed release artefacts | O2 | Built: a non-root image for amd64 and arm64, npm provenance, cosign signatures and GitHub attestations on tag. Not yet released |
 | Security docs: threat model, data-flow page naming every party, permission list with a reason for each, troubleshooting keyed to `doctor` output | 1.0 assets | Not started |
-| Baseline test run on the base branch | P1 | Not started |
+| Baseline test run on the base branch | P1 | Done. Checks that also fail on the base branch are marked for the agent, in the PR and on the ticket. They still get fix rounds and keep a draft, since one failing command can hide new failures |
 | Cap on open agent PRs per repository, daily run cap | P1 | Done. Runs over a cap wait in the queue and say why on the ticket |
 
 Exit gate: five fresh installs each reach a first PR in under 15 minutes.

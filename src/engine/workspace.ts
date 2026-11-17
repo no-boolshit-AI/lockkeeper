@@ -46,6 +46,13 @@ export interface CheckResult {
   passed: boolean;
   durationMs: number;
   output: string;
+  /** It failed on the base branch too, before the agent changed anything. */
+  failedOnBase?: boolean;
+}
+
+/** Failures the agent's change caused: not the ones the base branch already had. */
+export function newFailures(checks: readonly CheckResult[]): CheckResult[] {
+  return checks.filter((check) => !check.passed && !check.failedOnBase);
 }
 
 export async function cloneRepo(
@@ -150,6 +157,21 @@ export async function resetCheckout(
       tail(result.stderr || result.stdout),
     );
   }
+}
+
+/** The whole change against a commit as a unified diff, for a dry run to show. Capped. */
+export async function stagedDiff(
+  sandbox: SandboxHandle,
+  layout: Layout,
+  baseSha: string,
+  maxBytes = 200_000,
+): Promise<string> {
+  if (!isObjectId(baseSha)) throw new Error(`Invalid base commit: ${baseSha}`);
+  const result = await sandbox.exec(
+    `git add -A && git diff --cached --no-color --no-ext-diff --no-renames ${baseSha} | head -c ${maxBytes}`,
+    { cwd: layout.repo, timeoutMs: 120_000 },
+  );
+  return result.exitCode === 0 ? result.stdout : '';
 }
 
 /** Where two commits' histories meet: the point a pull request branch forked from. */

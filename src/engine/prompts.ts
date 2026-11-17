@@ -350,10 +350,11 @@ export function buildFollowUpPrompt(input: {
 }
 
 export function buildFixPrompt(
-  failures: { command: string; exitCode: number; output: string }[],
+  failures: { command: string; exitCode: number; output: string; failedOnBase?: boolean }[],
 ): string {
   const sections = failures.map(
-    (failure) => `$ ${failure.command}   (exit ${failure.exitCode})\n${failure.output}`,
+    (failure) =>
+      `$ ${failure.command}   (exit ${failure.exitCode})${failure.failedOnBase ? '\nThis check also failed on the base branch before your change. Fix what your change broke; if the rest has nothing to do with the ticket, leave it and say so in your report.' : ''}\n${failure.output}`,
   );
   return `Lockkeeper ran the checks after you stopped, and some failed:
 
