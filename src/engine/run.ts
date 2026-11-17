@@ -1479,6 +1479,13 @@ class TicketRun {
     this.log.step('Collecting and checking the changes');
     // What this run adds, which is what it commits.
     const collected = await collectChanges(sandbox, layout, base.sha);
+    // Kept for the run page. Read back from the sandbox, so redacted and capped.
+    if (!this.deps.store.latestEvent(this.run.id, 'diff')) {
+      this.audit('diff', {
+        base: base.sha,
+        text: redactSecrets(await stagedDiff(sandbox, layout, base.sha)).text,
+      });
+    }
     // What reviewers see. On a retry that is the whole pull request since it forked,
     // so a protected file an earlier attempt changed still keeps the PR a draft.
     let reviewed = collected;

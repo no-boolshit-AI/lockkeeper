@@ -149,6 +149,7 @@ For Codex, put the OpenAI key in `CODEX_API_KEY`; for OpenCode, in the provider'
 | `lockkeeper check [--live]` | Validate the config and credentials; with `--live`, call Jira, GitHub and E2B |
 | `lockkeeper secrets sync` | Store the model key as an E2B secret so it never enters a sandbox |
 | `lockkeeper runs [id]` | List runs, or show one run's audit log |
+| `lockkeeper ui [--port N]` | Serve the run page on 127.0.0.1: runs, live logs, diffs and costs. `lockkeeper start --ui` serves it next to the service |
 | `lockkeeper cancel <ticket>` | Cancel a ticket's active run and delete its sandbox |
 
 ## Development

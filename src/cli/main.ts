@@ -18,6 +18,7 @@ import { type ModelKey, type RunResult, runTicket } from '../engine/run.js';
 import { E2BProvider } from '../sandbox/e2b/e2b-provider.js';
 import { GitHubSourceControl } from '../scm/github/github-scm.js';
 import { JiraClient } from '../tracker/jira/client.js';
+import { startRunPage } from '../web/run-page.js';
 import {
   buildRunDeps,
   loadContext,
@@ -199,13 +200,19 @@ program
 program
   .command('start')
   .description('Watch Jira for labelled tickets and run them, until stopped with Ctrl-C')
-  .action(async () => {
+  .option('--ui', 'also serve the run page on 127.0.0.1')
+  .option('--ui-port <port>', 'port for the run page', (value) => Number.parseInt(value, 10), 0)
+  .action(async (options: { ui?: boolean; uiPort: number }) => {
     const globals = program.opts<{ config?: string; verbose?: boolean }>();
     const log = consoleLogger({ verbose: Boolean(globals.verbose) });
     const context = loadContext(globals.config);
     const { config } = context.loaded;
     const { deps, close } = await buildRunDeps(context, log);
     const daemon = new Daemon(deps, { pollMs: config.jira.poll_seconds * 1000 });
+    const page = options.ui
+      ? await startRunPage({ store: deps.store, port: options.uiPort })
+      : undefined;
+    if (page) log.step(`Run page: ${page.url}`);
     log.step(
       `Watching ${Object.keys(config.projects).join(', ')} for the "${config.jira.labels.trigger}" label every ${config.jira.poll_seconds} s. Press Ctrl-C to stop.`,
     );
@@ -230,8 +237,28 @@ program
     } finally {
       process.off('SIGINT', onSignal);
       process.off('SIGTERM', onSignal);
+      await page?.close();
       close();
     }
+  });
+
+program
+  .command('ui')
+  .description('Serve the run page on 127.0.0.1: runs, live logs, diffs and costs, read-only')
+  .option('--port <port>', 'port for the run page', (value) => Number.parseInt(value, 10), 0)
+  .action(async (options: { port: number }) => {
+    const globals = program.opts<{ config?: string }>();
+    const context = loadContext(globals.config);
+    const store = openStore(context);
+    const page = await startRunPage({ store, port: options.port });
+    out(`Run page: ${page.url}`);
+    out('It only answers on this machine. Press Ctrl-C to stop.');
+    await new Promise<void>((resolve) => {
+      process.once('SIGINT', resolve);
+      process.once('SIGTERM', resolve);
+    });
+    await page.close();
+    store.close();
   });
 
 function printResult(result: RunResult): void {
